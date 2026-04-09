@@ -1,0 +1,56 @@
+{
+  "productName": "TransferBridge",
+  "version": "1.1.0",
+  "identifier": "com.transferbridge.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "TransferBridge",
+        "width": 960,
+        "height": 620,
+        "minWidth": 800,
+        "minHeight": 550,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "Transfert de fichiers universel",
+    "longDescription": "Envoie n'importe quel fichier de ton téléphone vers ton PC en 3 secondes.",
+    "copyright": "© 2025 TransferBridge",
+    "category": "Utility",
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE0MUM5REE5OUUyQTY5QUIKUldTcmFTcWVxWjBjRkdGVmdpeDd6VlhIT0NkV1FEWDZoUEZqaWVkNGthY1JCV0ZGVVRKUGNudksK",
+      "endpoints": [
+        "https://github.com/acero98-jo/transferbridge/releases/latest/download/latest.json"
+      ],
+      "dialog": false,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}
