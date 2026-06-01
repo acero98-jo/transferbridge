@@ -1,6 +1,6 @@
 [package]
 name = "transferbridge"
-version = "0.1.0"
+version = "1.1.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -37,4 +37,5 @@ axum = { version = "0.7", features = ["multipart", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 uuid = { version = "1", features = ["v4"] }
+tokio-util = { version = "0.7", features = ["io"] }
 

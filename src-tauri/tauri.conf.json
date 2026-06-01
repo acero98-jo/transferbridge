@@ -1,6 +1,6 @@
 {
   "productName": "TransferBridge",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "identifier": "com.transferbridge.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -42,15 +42,15 @@
     "createUpdaterArtifacts": true
   },
   "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE0MUM5REE5OUUyQTY5QUIKUldTcmFTcWVxWjBjRkdGVmdpeDd6VlhIT0NkV1FEWDZoUEZqaWVkNGthY1JCV0ZGVVRKUGNudksK",
-      "endpoints": [
-        "https://github.com/acero98-jo/transferbridge/releases/latest/download/latest.json"
-      ],
-      "dialog": false,
-      "windows": {
-        "installMode": "passive"
-      }
+  "updater": {
+    "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE0MUM5REE5OUUyQTY5QUIKUldTcmFTcWVxWjBjRkdGVmdpeDd6VlhIT0NkV1FEWDZoUEZqaWVkNGthY1JCV0ZGVVRKUGNudksK",
+    "endpoints": [
+      "https://github.com/acero98-jo/transferbridge/releases/latest/download/latest.json"
+    ],
+    "dialog": false,
+    "windows": {
+      "installMode": "passive"
     }
   }
+}
 }

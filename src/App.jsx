@@ -7,6 +7,8 @@ import QRCode from "qrcode";
 import { languageNames, detectLanguage, getT } from "./i18n/index.js";
 import Feedback from "./Feedback.jsx";
 import Updater from "./Updater.jsx";
+import SendToPhone from "./SendToPhone.jsx";
+import ProActivation from "./ProActivation.jsx";
 
 export default function App() {
   const [serverUrl, setServerUrl] = useState(null);
@@ -25,13 +27,25 @@ export default function App() {
   const [lang, setLang] = useState(() => localStorage.getItem("tb_lang") || detectLanguage());
   const filesRef = useRef([]);
   const [showFeedback, setShowFeedback] = useState(false);
+  const [isPro, setIsPro] = useState(false);
+  const [showProModal, setShowProModal] = useState(false);
 
   const t = getT(lang);
 
   useEffect(() => { filesRef.current = files; }, [files]);
 
   useEffect(() => {
-    initApp();
+    // Initialise l'app de façon async
+    async function init() {
+      await initApp();
+
+      // Vérifie la licence Pro
+      try {
+        const proStatus = await invoke("check_license");
+        setIsPro(proStatus);
+      } catch (e) { console.error(e); }
+    }
+    init();
 
     const unlistenFile = listen("file-received", (e) => {
       const newFile = {
@@ -67,12 +81,17 @@ export default function App() {
       setTimeout(() => setSessionError(null), 5000);
     });
 
+    const unlistenPro = listen("pro-activated", () => {
+      setIsPro(true);
+    });
+
     return () => {
       unlistenFile.then(f => f());
       unlistenPin.then(f => f());
       unlistenDevice.then(f => f());
       unlistenProgress.then(f => f());
       unlistenError.then(f => f());
+      unlistenPro.then(f => f());
     };
   }, []);
 
@@ -85,21 +104,31 @@ export default function App() {
     setStatus("starting");
     try {
       await setupNotifications();
+
+      // 1. Charge l'historique
       const history = await invoke("load_history");
       if (Array.isArray(history) && history.length > 0) setFiles(history);
+
+      // 2. Charge le dossier
       const dir = await invoke("get_save_dir");
       setSaveDir(dir);
-      const config = await invoke("get_config");
-      setMaxSizeMb(config.max_file_size_mb);
-      await invoke("set_max_file_size", { sizeMb: config.max_file_size_mb });
+
+      // 3. Démarre le serveur EN PREMIER
       const url = await invoke("start_server");
       setServerUrl(url);
       setStatus("running");
+
       const qr = await QRCode.toDataURL(url, {
         width: 200, margin: 2,
         color: { dark: "#1e293b", light: "#f8fafc" }
       });
       setQrCode(qr);
+
+      // 4. Charge la config APRÈS le serveur
+      const config = await invoke("get_config");
+      setMaxSizeMb(config.max_file_size_mb);
+      await invoke("set_max_file_size", { sizeMb: config.max_file_size_mb });
+
     } catch (e) {
       console.error(e);
       setStatus("idle");
@@ -227,6 +256,15 @@ export default function App() {
         }}>
           {status === "running" ? t.statusActive : status === "starting" ? t.statusStarting : t.statusInactive}
         </div>
+
+        {/* Badge Pro */}
+        {isPro ? (
+          <div style={s.proBadge}>⚡ Pro</div>
+        ) : (
+          <button onClick={() => setShowProModal(true)} style={s.proBtn}>
+            ⚡ Passer Pro
+          </button>
+        )}
       </div>
 
       {/* Dossier destination */}
@@ -236,22 +274,16 @@ export default function App() {
         <button onClick={chooseSaveDir} style={s.dirBtn}>{t.changeFolder}</button>
       </div>
 
-      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginBottom: 12 }}>
-      <button onClick={() => setShowFeedback(true)} style={s.feedbackBtn}>
-      💬 Feedback
-      </button>
-      <button onClick={() => setShowSettings(!showSettings)} style={s.settingsBtn}>
-      {t.settings}
-      </button>
-      </div>
-
       {/* Erreur session */}
       {sessionError && (
         <div style={s.errorBanner}>{sessionError}</div>
       )}
 
-      {/* Bouton paramètres */}
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+      {/* Boutons feedback + paramètres — UNE SEULE FOIS */}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginBottom: 12 }}>
+        <button onClick={() => setShowFeedback(true)} style={s.feedbackBtn}>
+          💬 Feedback
+        </button>
         <button onClick={() => setShowSettings(!showSettings)} style={s.settingsBtn}>
           {t.settings}
         </button>
@@ -323,7 +355,7 @@ export default function App() {
 
       <div style={s.grid}>
 
-        {/* Panneau gauche : QR + PIN */}
+        {/* Panneau gauche : QR + PIN + SendToPhone */}
         <div style={s.card}>
           <h2 style={s.cardTitle}>{t.scanTitle}</h2>
           {qrCode ? (
@@ -359,6 +391,9 @@ export default function App() {
               {t.regeneratePin}
             </button>
           </div>
+
+          {/* Envoyer vers le téléphone */}
+          {status === "running" && <SendToPhone t={t} />}
 
           {/* Stats */}
           {files.length > 0 && (
@@ -477,10 +512,19 @@ export default function App() {
         </div>
 
       </div>
+
+      {/* Modals */}
       {showFeedback && (
-      <Feedback onClose={() => setShowFeedback(false)} t={t} />
+        <Feedback onClose={() => setShowFeedback(false)} t={t} />
+      )}
+      {showProModal && (
+        <ProActivation
+          onActivated={() => setIsPro(true)}
+          onClose={() => setShowProModal(false)}
+        />
       )}
       <Updater />
+
     </div>
   );
 }
@@ -494,10 +538,22 @@ const s = {
   header: {
     display: "flex", alignItems: "center", gap: 14, marginBottom: 12,
     padding: "14px 18px", background: "#1e293b", borderRadius: 14,
+    flexWrap: "wrap",
   },
   title: { fontSize: 18, fontWeight: 700, margin: 0 },
   subtitle: { fontSize: 12, color: "#94a3b8", margin: 0 },
   badge: { padding: "6px 12px", borderRadius: 20, fontSize: 13, fontWeight: 600 },
+  proBadge: {
+    padding: "6px 12px", background: "rgba(251,191,36,0.15)",
+    border: "1px solid rgba(251,191,36,0.3)", borderRadius: 20,
+    fontSize: 13, fontWeight: 600, color: "#FBBF24",
+  },
+  proBtn: {
+    padding: "6px 14px",
+    background: "linear-gradient(135deg, #3b82f6, #06b6d4)",
+    color: "white", border: "none", borderRadius: 20,
+    fontSize: 13, fontWeight: 600, cursor: "pointer",
+  },
   dirBar: {
     display: "flex", alignItems: "center", gap: 10, marginBottom: 16,
     padding: "10px 16px", background: "#1e293b", borderRadius: 10,
@@ -510,6 +566,37 @@ const s = {
     padding: "5px 12px", background: "#334155", color: "#94a3b8",
     border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer",
   },
+  errorBanner: {
+    background: "#450a0a", color: "#fca5a5", padding: "10px 16px",
+    borderRadius: 10, fontSize: 13, marginBottom: 12, border: "1px solid #7f1d1d",
+  },
+  feedbackBtn: {
+    padding: "6px 14px", background: "rgba(59,130,246,0.1)",
+    color: "#60a5fa", border: "1px solid rgba(59,130,246,0.25)",
+    borderRadius: 8, fontSize: 13, cursor: "pointer",
+  },
+  settingsBtn: {
+    padding: "6px 14px", background: "#1e293b", color: "#94a3b8",
+    border: "1px solid #334155", borderRadius: 8, fontSize: 13, cursor: "pointer",
+  },
+  settingsPanel: {
+    background: "#1e293b", borderRadius: 14, padding: 20, marginBottom: 16,
+    border: "1px solid #334155",
+  },
+  settingsTitle: { fontSize: 15, fontWeight: 600, marginBottom: 16, color: "#f1f5f9" },
+  settingRow: {
+    display: "flex", justifyContent: "space-between", alignItems: "center",
+    padding: "12px 0", borderBottom: "1px solid #334155",
+  },
+  settingLabel: { fontSize: 14, fontWeight: 500, marginBottom: 2 },
+  settingDesc: { fontSize: 12, color: "#64748b" },
+  sizeInput: {
+    width: 80, padding: "6px 10px", background: "#0f172a",
+    border: "1px solid #334155", borderRadius: 8,
+    color: "#f1f5f9", fontSize: 14, textAlign: "center", outline: "none",
+  },
+  presetBtn: { padding: "5px 12px", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer" },
+  settingInfo: { marginTop: 12, fontSize: 11, color: "#475569", textAlign: "center" },
   grid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 },
   card: { background: "#1e293b", borderRadius: 14, padding: 20 },
   cardTitle: { fontSize: 15, fontWeight: 600, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 },
@@ -555,36 +642,4 @@ const s = {
   progressBar: { width: "100%", height: 4, background: "#334155", borderRadius: 2, overflow: "hidden" },
   progressFill: { height: "100%", borderRadius: 2, transition: "width 0.15s ease" },
   progressLabel: { fontSize: 11, color: "#64748b" },
-  errorBanner: {
-    background: "#450a0a", color: "#fca5a5", padding: "10px 16px",
-    borderRadius: 10, fontSize: 13, marginBottom: 12, border: "1px solid #7f1d1d",
-  },
-  settingsBtn: {
-    padding: "6px 14px", background: "#1e293b", color: "#94a3b8",
-    border: "1px solid #334155", borderRadius: 8, fontSize: 13, cursor: "pointer",
-  },
-  settingsPanel: {
-    background: "#1e293b", borderRadius: 14, padding: 20, marginBottom: 16,
-    border: "1px solid #334155",
-  },
-  settingsTitle: { fontSize: 15, fontWeight: 600, marginBottom: 16, color: "#f1f5f9" },
-  settingRow: {
-    display: "flex", justifyContent: "space-between", alignItems: "center",
-    padding: "12px 0", borderBottom: "1px solid #334155",
-  },
-  settingLabel: { fontSize: 14, fontWeight: 500, marginBottom: 2 },
-  settingDesc: { fontSize: 12, color: "#64748b" },
-  sizeInput: {
-    width: 80, padding: "6px 10px", background: "#0f172a",
-    border: "1px solid #334155", borderRadius: 8,
-    color: "#f1f5f9", fontSize: 14, textAlign: "center", outline: "none",
-  },
-  presetBtn: { padding: "5px 12px", border: "none", borderRadius: 8, fontSize: 12, cursor: "pointer" },
-  settingInfo: { marginTop: 12, fontSize: 11, color: "#475569", textAlign: "center" },
-
-  feedbackBtn: {
-  padding: "6px 14px", background: "rgba(59,130,246,0.1)",
-  color: "#60a5fa", border: "1px solid rgba(59,130,246,0.25)",
-  borderRadius: 8, fontSize: 13, cursor: "pointer",
-},
 };

@@ -5091,7 +5091,7 @@ dependencies = [
 
 [[package]]
 name = "transferbridge"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
  "axum",
  "bytes",
@@ -5109,6 +5109,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "tower-http 0.5.2",
  "uuid",
 ]
