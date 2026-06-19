@@ -1,6 +1,6 @@
 [package]
 name = "transferbridge"
-version = "1.1.1"
+version = "1.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -31,6 +31,7 @@ futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+hostname = "0.3"
 
 # Notre serveur HTTP
 axum = { version = "0.7", features = ["multipart", "ws"] }

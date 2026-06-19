@@ -24,6 +24,8 @@ export default function SendToPhone({ t }) {
   }
 
   async function pickFile() {
+    const info = await invoke("get_plan_info");
+    if (!info.bidirectional) return;
     setLoading(true);
     try {
       const selected = await open({
