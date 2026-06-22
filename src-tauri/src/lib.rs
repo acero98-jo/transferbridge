@@ -457,10 +457,16 @@ async fn activate_license(
 
     let device_id = global.device_id.lock().unwrap().clone();
 
-    // Vérification côté serveur (optionnel en sandbox)
-    let client = reqwest::Client::new();
+    // ── Vérification côté serveur — OBLIGATOIRE, fail-closed ──
+    // Pointe vers le Worker Cloudflare qui vérifie la signature HMAC.
+    // Remplace par ton URL réelle de Worker une fois déployé.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
     let res = client
-        .post("https://transferbridge.site/.netlify/functions/verify-license")
+        .post("https://transferbridge-license.abouacero1998.workers.dev/")
         .json(&serde_json::json!({
             "key":       key,
             "plan":      plan,
@@ -468,11 +474,33 @@ async fn activate_license(
         }))
         .send().await;
 
-    // Si le serveur est inaccessible on accepte quand même (mode offline)
-    // mais on log l'erreur
-    if let Ok(resp) = res {
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            return Err("Clé invalide ou déjà utilisée sur un autre appareil".to_string());
+    // Fail-closed : si le serveur ne confirme pas explicitement le succès,
+    // on REFUSE l'activation. Plus de bypass possible si le serveur est down.
+    match res {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                // Tente de récupérer le message d'erreur du serveur
+                let err_msg = resp.json::<serde_json::Value>().await
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| "Clé invalide ou déjà utilisée sur un autre appareil".to_string());
+                return Err(err_msg);
+            }
+            // Vérifie explicitement le champ "success" dans la réponse
+            let body: serde_json::Value = resp.json().await
+                .map_err(|_| "Réponse du serveur de licence invalide".to_string())?;
+            if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+                return Err("Vérification de licence échouée".to_string());
+            }
+        }
+        Err(_) => {
+            // Le serveur est inaccessible (pas d'internet, Worker down, etc.)
+            // → on REFUSE par sécurité, contrairement à avant.
+            return Err(
+                "Impossible de vérifier la licence — vérifie ta connexion internet et réessaie."
+                    .to_string()
+            );
         }
     }
 
