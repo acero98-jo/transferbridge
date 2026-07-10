@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 
 const CATEGORIES = [
   { key: "bug",         label: "🐛 Bug",         desc: "Quelque chose ne fonctionne pas" },
@@ -23,13 +24,14 @@ export default function Feedback({ onClose, t }) {
     if (!message.trim()) { setError("Merci d'écrire un message."); return; }
     setLoading(true); setError(null);
     try {
+      const appVersion = await getVersion().catch(() => "unknown");
       await invoke("send_feedback", {
         payload: {
           rating,
           category: category || "general",
           message: message.trim(),
           email: email.trim() || null,
-          app_version: "1.0.0",
+          app_version: appVersion,
           os: navigator.platform || "Windows",
         }
       });

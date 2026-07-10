@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
+import { formatSize, getFileIcon } from "./utils.js";
 
 export default function SendToPhone({ t }) {
   const [pendingFiles, setPendingFiles] = useState([]);
@@ -51,25 +52,6 @@ export default function SendToPhone({ t }) {
       await invoke("cancel_pending_file", { fileId });
       setPendingFiles(prev => prev.filter(f => f.id !== fileId));
     } catch (e) { console.error(e); }
-  }
-
-  function formatSize(bytes) {
-    if (!bytes) return "0 o";
-    if (bytes < 1024) return bytes + " o";
-    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " Ko";
-    return (bytes / 1048576).toFixed(1) + " Mo";
-  }
-
-  function getFileIcon(name) {
-    if (!name) return "📎";
-    const ext = name.split(".").pop().toLowerCase();
-    if (["jpg","jpeg","png","gif","webp"].includes(ext)) return "🖼️";
-    if (["mp4","mov","avi","mkv"].includes(ext)) return "🎬";
-    if (ext === "pdf") return "📄";
-    if (["zip","rar","7z"].includes(ext)) return "🗜️";
-    if (["mp3","wav","aac"].includes(ext)) return "🎵";
-    if (["doc","docx"].includes(ext)) return "📝";
-    return "📎";
   }
 
   return (

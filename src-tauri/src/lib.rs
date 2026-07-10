@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, Multipart, State, Query},
+    extract::{DefaultBodyLimit, Path, Multipart, State, Query},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::{Method, StatusCode, header},
     response::{Html, Response},
@@ -130,6 +130,7 @@ fn current_day() -> String {
 
 struct GlobalState {
     pin:            Arc<Mutex<String>>,
+    pin_attempts:   Arc<Mutex<PinAttempts>>,
     sessions:       Arc<Mutex<Vec<Session>>>,
     save_dir:       Arc<Mutex<PathBuf>>,
     started:        Mutex<bool>,
@@ -144,6 +145,44 @@ struct GlobalState {
     tunnel_active:  Arc<Mutex<bool>>,
 }
 
+// ─── Anti brute-force PIN ──────────────────────────────────────────
+// Le PIN fait 4 chiffres (10 000 combinaisons) : sans verrouillage,
+// un attaquant sur le même réseau local pourrait le deviner en quelques
+// secondes. On verrouille les tentatives après plusieurs échecs, avec
+// un backoff exponentiel plafonné.
+#[derive(Default)]
+struct PinAttempts {
+    fail_count:   u32,
+    locked_until: Option<Instant>,
+}
+
+impl PinAttempts {
+    const MAX_ATTEMPTS: u32 = 5;
+    const BASE_LOCKOUT_SECS: u64 = 30;
+    const MAX_LOCKOUT_SECS: u64 = 300;
+
+    fn seconds_locked(&self) -> Option<u64> {
+        self.locked_until.and_then(|until| {
+            let now = Instant::now();
+            if until > now { Some((until - now).as_secs() + 1) } else { None }
+        })
+    }
+
+    fn register_failure(&mut self) {
+        self.fail_count += 1;
+        if self.fail_count >= Self::MAX_ATTEMPTS {
+            let extra = (self.fail_count - Self::MAX_ATTEMPTS).min(4);
+            let secs = (Self::BASE_LOCKOUT_SECS * (1u64 << extra)).min(Self::MAX_LOCKOUT_SECS);
+            self.locked_until = Some(Instant::now() + Duration::from_secs(secs));
+        }
+    }
+
+    fn register_success(&mut self) {
+        self.fail_count = 0;
+        self.locked_until = None;
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 struct PendingFile {
     id:       String,
@@ -156,6 +195,7 @@ struct PendingFile {
 #[derive(Clone)]
 struct AppState {
     pin:           Arc<Mutex<String>>,
+    pin_attempts:  Arc<Mutex<PinAttempts>>,
     sessions:      Arc<Mutex<Vec<Session>>>,
     save_dir:      Arc<Mutex<PathBuf>>,
     app_handle:    AppHandle,
@@ -218,11 +258,12 @@ async fn start_server(
     let ip = get_local_ip();
 
     {
-        let mut started = global.started.lock().unwrap();
+        let mut started = global.started.lock().unwrap_or_else(|e| e.into_inner());
         if *started {
             let pin = generate_pin();
-            *global.pin.lock().unwrap() = pin.clone();
-            global.sessions.lock().unwrap().clear();
+            *global.pin.lock().unwrap_or_else(|e| e.into_inner()) = pin.clone();
+            global.sessions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            *global.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()) = PinAttempts::default();
             let _ = app.emit("pin-generated", pin);
             return Ok(format!("http://{}:3030", ip));
         }
@@ -240,22 +281,23 @@ async fn start_server(
             id
         }
     };
-    *global.device_id.lock().unwrap() = device_id;
+    *global.device_id.lock().unwrap_or_else(|e| e.into_inner()) = device_id;
 
     let save_dir = app.path().download_dir()
         .unwrap_or_else(|_| PathBuf::from("."));
-    *global.save_dir.lock().unwrap() = save_dir;
+    *global.save_dir.lock().unwrap_or_else(|e| e.into_inner()) = save_dir;
 
     // Charge la licence si elle existe
     if let Ok(license) = load_license_data(&app).await {
-        *global.plan.lock().unwrap() = license.plan;
+        *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = license.plan;
     }
 
     let pin = generate_pin();
-    *global.pin.lock().unwrap() = pin.clone();
+    *global.pin.lock().unwrap_or_else(|e| e.into_inner()) = pin.clone();
 
     let state = AppState {
         pin:           Arc::clone(&global.pin),
+        pin_attempts:  Arc::clone(&global.pin_attempts),
         sessions:      Arc::clone(&global.sessions),
         save_dir:      Arc::clone(&global.save_dir),
         app_handle:    app.clone(),
@@ -283,6 +325,10 @@ async fn start_server(
         .route("/send/:file_id", get(download_file))
         .route("/plan-info",     get(get_plan_info_route))
         .with_state(state)
+        // Plafond de sécurité contre les requêtes anormalement volumineuses
+        // (protège la mémoire du process ; la limite réelle par plan est
+        // appliquée dans handle_upload une fois le champ lu).
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024))
         .layer(cors);
 
     tokio::spawn(async move {
@@ -298,7 +344,7 @@ async fn start_server(
     let _ = app.emit("pin-generated", pin.clone());
 
     // ── Lance le tunnel Cloudflare si plan Pro ──
-    let plan = global.plan.lock().unwrap().clone();
+    let plan = global.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if plan.allows_bidirectional() {
         let app_clone   = app.clone();
         let tunnel_url  = Arc::clone(&global.tunnel_url);
@@ -316,7 +362,7 @@ async fn start_server(
                 Ok(path) => {
                     match launch_tunnel(path, app_clone.clone(), tunnel_url, tunnel_act).await {
                         Ok(child) => {
-                            *tunnel_proc.lock().unwrap() = Some(child);
+                            *tunnel_proc.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
                             println!("☁️  Tunnel Cloudflare lancé");
                         }
                         Err(e) => {
@@ -342,15 +388,16 @@ async fn regenerate_pin(
     global: tauri::State<'_, GlobalState>,
 ) -> Result<String, String> {
     let new_pin = generate_pin();
-    *global.pin.lock().unwrap() = new_pin.clone();
-    global.sessions.lock().unwrap().clear();
+    *global.pin.lock().unwrap_or_else(|e| e.into_inner()) = new_pin.clone();
+    global.sessions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *global.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()) = PinAttempts::default();
     let _ = app.emit("pin-generated", new_pin.clone());
     Ok(new_pin)
 }
 
 #[tauri::command]
 fn get_save_dir(global: tauri::State<'_, GlobalState>) -> String {
-    global.save_dir.lock().unwrap().to_string_lossy().to_string()
+    global.save_dir.lock().unwrap_or_else(|e| e.into_inner()).to_string_lossy().to_string()
 }
 
 #[tauri::command]
@@ -358,7 +405,7 @@ fn set_save_dir(
     global: tauri::State<'_, GlobalState>,
     path: String,
 ) -> Result<(), String> {
-    *global.save_dir.lock().unwrap() = PathBuf::from(&path);
+    *global.save_dir.lock().unwrap_or_else(|e| e.into_inner()) = PathBuf::from(&path);
     println!("📁 Dossier changé : {}", path);
     Ok(())
 }
@@ -406,12 +453,12 @@ struct PlanInfo {
 fn get_plan_info(
     global: tauri::State<'_, GlobalState>,
 ) -> PlanInfo {
-    let plan = global.plan.lock().unwrap().clone();
-    let mut counter = global.daily_counter.lock().unwrap();
+    let plan = global.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut counter = global.daily_counter.lock().unwrap_or_else(|e| e.into_inner());
     counter.reset_if_new_day();
     let limit = plan.max_uploads_per_day();
     let left  = counter.remaining(limit);
-    let device_id = global.device_id.lock().unwrap().clone();
+    let device_id = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     PlanInfo {
         plan_label:    plan.label().to_string(),
@@ -455,7 +502,7 @@ async fn activate_license(
         _         => return Err("Plan inconnu".to_string()),
     };
 
-    let device_id = global.device_id.lock().unwrap().clone();
+    let device_id = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     // ── Vérification côté serveur — OBLIGATOIRE, fail-closed ──
     // Pointe vers le Worker Cloudflare qui vérifie la signature HMAC.
@@ -530,7 +577,7 @@ async fn activate_license(
     tokio::fs::write(&path, json.as_bytes()).await
         .map_err(|e: std::io::Error| e.to_string())?;
 
-    *global.plan.lock().unwrap() = plan_type;
+    *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = plan_type;
 
     let _ = app.emit("plan-changed", license.plan.label());
     println!("⚡ Plan activé : {}", plan);
@@ -554,7 +601,7 @@ async fn check_license(
             if let Some(exp) = license.expires_at {
                 if now > exp {
                     // Licence expirée → retour au plan gratuit
-                    *global.plan.lock().unwrap() = PlanType::Free;
+                    *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = PlanType::Free;
                     let _ = tokio::fs::remove_file(get_license_path(&app)?).await;
                     return Ok(serde_json::json!({
                         "plan": "free",
@@ -565,7 +612,7 @@ async fn check_license(
             }
 
             // Vérifie le device ID
-            let current_device = global.device_id.lock().unwrap().clone();
+            let current_device = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if license.device_id != current_device
                 && license.plan != PlanType::Team {
                 return Ok(serde_json::json!({
@@ -575,7 +622,7 @@ async fn check_license(
                 }));
             }
 
-            *global.plan.lock().unwrap() = license.plan.clone();
+            *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = license.plan.clone();
 
             Ok(serde_json::json!({
                 "plan":         license.plan,
@@ -598,7 +645,7 @@ async fn deactivate_license(
         tokio::fs::remove_file(&path).await
             .map_err(|e: std::io::Error| e.to_string())?;
     }
-    *global.plan.lock().unwrap() = PlanType::Free;
+    *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = PlanType::Free;
     let _ = app.emit("plan-changed", "free");
     println!("🔓 Licence désactivée sur cet appareil");
     Ok(())
@@ -625,7 +672,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
     // Envoie les infos du plan au téléphone dès la connexion
     let plan_info = {
-        let plan = state.plan.lock().unwrap().clone();
+        let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
         serde_json::json!({
             "type":           "plan-info",
             "bidirectional":  plan.allows_bidirectional(),
@@ -670,8 +717,8 @@ async fn get_plan_info_route(
     if !is_valid_session(&state.sessions, &token) {
         return Err((StatusCode::UNAUTHORIZED, "Session invalide".to_string()));
     }
-    let plan = state.plan.lock().unwrap().clone();
-    let mut counter = state.daily_counter.lock().unwrap();
+    let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut counter = state.daily_counter.lock().unwrap_or_else(|e| e.into_inner());
     counter.reset_if_new_day();
 
     Ok(Json(serde_json::json!({
@@ -686,21 +733,45 @@ async fn verify_pin(
     State(state): State<AppState>,
     Json(body):   Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let input   = body["pin"].as_str().unwrap_or("").to_string();
-    let correct = state.pin.lock().unwrap().clone();
-
-    println!("🔐 Vérification PIN : saisie='{}' correct='{}'", input, correct);
-
-    if input != correct {
-        let _ = state.app_handle.emit("pin-failed", &input);
+    // Anti brute-force : refuse toute tentative pendant le verrouillage,
+    // sans même comparer le PIN (évite de "gaspiller" une fenêtre de timing).
+    if let Some(retry_after) = state.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()).seconds_locked() {
         return Err((
-            StatusCode::UNAUTHORIZED,
-            serde_json::json!({ "success": false, "error": "PIN incorrect" }).to_string(),
+            StatusCode::TOO_MANY_REQUESTS,
+            serde_json::json!({
+                "success": false,
+                "error": "locked",
+                "message": "Trop de tentatives incorrectes. Réessaie plus tard.",
+                "retry_after": retry_after,
+            }).to_string(),
         ));
     }
 
+    let input   = body["pin"].as_str().unwrap_or("").to_string();
+    let correct = state.pin.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    if input != correct {
+        let retry_after = {
+            let mut attempts = state.pin_attempts.lock().unwrap_or_else(|e| e.into_inner());
+            attempts.register_failure();
+            attempts.seconds_locked()
+        };
+        let _ = state.app_handle.emit("pin-failed", &input);
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({
+                "success": false,
+                "error": "PIN incorrect",
+                "locked": retry_after.is_some(),
+                "retry_after": retry_after,
+            }).to_string(),
+        ));
+    }
+
+    state.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()).register_success();
+
     let token = uuid::Uuid::new_v4().to_string();
-    state.sessions.lock().unwrap().push(Session {
+    state.sessions.lock().unwrap_or_else(|e| e.into_inner()).push(Session {
         token:      token.clone(),
         expires_at: Instant::now() + Duration::from_secs(600),
     });
@@ -710,8 +781,8 @@ async fn verify_pin(
     }));
 
     // Envoie aussi les infos du plan avec le token
-    let plan = state.plan.lock().unwrap().clone();
-    let mut counter = state.daily_counter.lock().unwrap();
+    let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut counter = state.daily_counter.lock().unwrap_or_else(|e| e.into_inner());
     counter.reset_if_new_day();
 
     Ok(Json(serde_json::json!({
@@ -725,7 +796,7 @@ async fn verify_pin(
 }
 
 fn is_valid_session(sessions: &Arc<Mutex<Vec<Session>>>, token: &str) -> bool {
-    let mut s = sessions.lock().unwrap();
+    let mut s = sessions.lock().unwrap_or_else(|e| e.into_inner());
     s.retain(|s| s.expires_at > Instant::now());
     s.iter().any(|s| s.token == token)
 }
@@ -736,7 +807,7 @@ async fn handle_upload(
 ) -> Result<String, (StatusCode, String)> {
     let mut token = String::new();
     let mut files_data: Vec<(String, Vec<u8>)> = vec![];
-    let max_size = *state.max_file_size.lock().unwrap();
+    let max_size = *state.max_file_size.lock().unwrap_or_else(|e| e.into_inner());
 
     while let Some(field) = multipart.next_field().await
         .map_err(|e: axum::extract::multipart::MultipartError| (StatusCode::BAD_REQUEST, e.to_string()))?
@@ -751,7 +822,7 @@ async fn handle_upload(
                 .map_err(|e: axum::extract::multipart::MultipartError| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
             // Vérif taille selon plan
-            let plan = state.plan.lock().unwrap().clone();
+            let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let plan_max = plan.max_file_size_bytes();
             let effective_max = if plan_max == 0 { max_size } else { plan_max.min(max_size) };
 
@@ -776,8 +847,8 @@ async fn handle_upload(
 
     // Vérif limite journalière
     {
-        let plan = state.plan.lock().unwrap().clone();
-        let mut counter = state.daily_counter.lock().unwrap();
+        let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut counter = state.daily_counter.lock().unwrap_or_else(|e| e.into_inner());
 
         if !counter.can_upload(plan.max_uploads_per_day()) {
             let _ = state.app_handle.emit("upload-error", serde_json::json!({
@@ -799,7 +870,7 @@ async fn handle_upload(
     for (filename, data) in files_data {
         let file_size: usize = data.len();
         let save_path = {
-            let dir = state.save_dir.lock().unwrap();
+            let dir = state.save_dir.lock().unwrap_or_else(|e| e.into_inner());
             get_unique_path(dir.join(&filename))
         };
         tokio::fs::write(&save_path, data.as_slice()).await
@@ -812,8 +883,8 @@ async fn handle_upload(
     }
 
     // Envoie le compteur mis à jour
-    let plan = state.plan.lock().unwrap().clone();
-    let mut counter = state.daily_counter.lock().unwrap();
+    let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut counter = state.daily_counter.lock().unwrap_or_else(|e| e.into_inner());
     let remaining = counter.remaining(plan.max_uploads_per_day());
     let _ = state.app_handle.emit("counter-updated", serde_json::json!({
         "uploads_today": counter.count,
@@ -836,13 +907,13 @@ async fn list_pending_files(
     }
 
     // Bidirectionnel réservé aux plans payants
-    let plan = state.plan.lock().unwrap().clone();
+    let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if !plan.allows_bidirectional() {
         return Ok(Json(serde_json::json!({ "files": [], "pro_required": true })));
     }
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let mut files = state.pending_files.lock().unwrap();
+    let mut files = state.pending_files.lock().unwrap_or_else(|e| e.into_inner());
     files.retain(|f| now - f.added_at < 600);
 
     let list: Vec<serde_json::Value> = files.iter().map(|f| {
@@ -862,13 +933,13 @@ async fn download_file(
         return Err((StatusCode::UNAUTHORIZED, "Session invalide".to_string()));
     }
 
-    let plan = state.plan.lock().unwrap().clone();
+    let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if !plan.allows_bidirectional() {
         return Err((StatusCode::FORBIDDEN, "Fonctionnalité Pro requise".to_string()));
     }
 
     let file_info = {
-        let files = state.pending_files.lock().unwrap();
+        let files = state.pending_files.lock().unwrap_or_else(|e| e.into_inner());
         files.iter().find(|f| f.id == file_id).cloned()
     };
 
@@ -899,11 +970,9 @@ async fn download_file(
 // ─── Utilitaires ──────────────────────────────────────────────────
 
 fn generate_pin() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
-    let tid = format!("{:?}", std::thread::current().id());
-    let seed = nanos ^ tid.bytes().fold(0u32, |a, b| a.wrapping_add(b as u32));
-    format!("{:04}", seed % 10000)
+    use rand::Rng;
+    let n: u32 = rand::thread_rng().gen_range(0..10_000);
+    format!("{:04}", n)
 }
 
 fn get_unique_path(path: PathBuf) -> PathBuf {
@@ -921,9 +990,16 @@ fn get_unique_path(path: PathBuf) -> PathBuf {
 
 fn get_local_ip() -> String {
     use std::net::UdpSocket;
-    let s = UdpSocket::bind("0.0.0.0:0").unwrap();
-    s.connect("8.8.8.8:80").unwrap();
-    s.local_addr().unwrap().ip().to_string()
+    let detected = (|| -> Option<String> {
+        let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+        s.connect("8.8.8.8:80").ok()?;
+        Some(s.local_addr().ok()?.ip().to_string())
+    })();
+
+    detected.unwrap_or_else(|| {
+        eprintln!("⚠️  Impossible de détecter l'IP locale (pas de réseau ?), repli sur 127.0.0.1");
+        "127.0.0.1".to_string()
+    })
 }
 
 // ─── Config ───────────────────────────────────────────────────────
@@ -969,7 +1045,7 @@ fn set_max_file_size(
     global: tauri::State<'_, GlobalState>,
     size_mb: u64,
 ) -> Result<(), String> {
-    *global.max_file_size.lock().unwrap() = size_mb * 1024 * 1024;
+    *global.max_file_size.lock().unwrap_or_else(|e| e.into_inner()) = size_mb * 1024 * 1024;
     println!("📏 Limite fichier : {}MB", size_mb);
     Ok(())
 }
@@ -1017,7 +1093,7 @@ async fn send_feedback(payload: FeedbackPayload) -> Result<String, String> {
         }]
     });
 
-    let webhook_url = "REMPLACE_PAR_TON_WEBHOOK_DISCORD";
+    let webhook_url = "https://discord.com/api/webhooks/1489240590427099266/0tWrGqPXORR-WtVPLsPiVcx1t6t_Nni0pPjK9kRFeLqsP9vdt5XWvFSeADnSVxc56ele";
     let client = reqwest::Client::new();
     let res = client.post(webhook_url)
         .header("Content-Type", "application/json")
@@ -1070,7 +1146,7 @@ async fn queue_file_for_send(
 ) -> Result<serde_json::Value, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let plan = global.plan.lock().unwrap().clone();
+    let plan = global.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if !plan.allows_bidirectional() {
         return Err("Fonctionnalité réservée au plan Pro".to_string());
     }
@@ -1088,7 +1164,7 @@ async fn queue_file_for_send(
         size: metadata.len(), path: path.clone(), added_at: timestamp,
     };
 
-    global.pending_files.lock().unwrap().push(pending.clone());
+    global.pending_files.lock().unwrap_or_else(|e| e.into_inner()).push(pending.clone());
     println!("📤 Fichier en attente : {} ({})", filename, file_id);
 
     let _ = app.emit("file-queued", serde_json::json!({
@@ -1102,7 +1178,7 @@ async fn queue_file_for_send(
 fn get_pending_files(global: tauri::State<'_, GlobalState>) -> Vec<PendingFile> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let mut files = global.pending_files.lock().unwrap();
+    let mut files = global.pending_files.lock().unwrap_or_else(|e| e.into_inner());
     files.retain(|f| now - f.added_at < 600);
     files.clone()
 }
@@ -1112,470 +1188,13 @@ fn cancel_pending_file(
     global:  tauri::State<'_, GlobalState>,
     file_id: String,
 ) -> Result<(), String> {
-    global.pending_files.lock().unwrap().retain(|f| f.id != file_id);
+    global.pending_files.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| f.id != file_id);
     println!("❌ Fichier annulé : {}", file_id);
     Ok(())
 }
 
 // ─── Interface mobile HTML ────────────────────────────────────────
-const MOBILE_UI: &str = r#"<!DOCTYPE html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>TransferBridge</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #f1f5f9; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
-    .logo { font-size: 48px; text-align: center; margin-bottom: 12px; }
-    h1 { font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 4px; }
-    .subtitle { color: #94a3b8; font-size: 14px; text-align: center; margin-bottom: 32px; }
-
-    /* PIN */
-    #pin-screen { width: 100%; max-width: 340px; }
-    .pin-label { font-size: 15px; color: #94a3b8; text-align: center; margin-bottom: 20px; }
-    .pin-inputs { display: flex; justify-content: center; gap: 12px; margin-bottom: 24px; }
-    .pin-digit { width: 60px; height: 68px; background: #1e293b; border: 2px solid #334155; border-radius: 12px; font-size: 28px; font-weight: 700; color: #f1f5f9; text-align: center; outline: none; transition: border-color 0.2s; caret-color: transparent; }
-    .pin-digit:focus { border-color: #3b82f6; }
-    .pin-digit.filled { border-color: #3b82f6; background: #1e3a5f; }
-    .pin-digit.error { border-color: #ef4444; animation: shake 0.3s; }
-    @keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-6px)} 75%{transform:translateX(6px)} }
-    .pin-btn { width: 100%; padding: 18px; background: #334155; color: white; border: none; border-radius: 14px; font-size: 17px; font-weight: 600; cursor: pointer; }
-    .pin-btn.active { background: #3b82f6; }
-    .pin-error { margin-top: 14px; padding: 12px; background: #450a0a; border-radius: 10px; color: #fca5a5; font-size: 13px; text-align: center; display: none; }
-
-    /* Upload */
-    #upload-screen { width: 100%; max-width: 400px; display: none; }
-    .connected-badge { background: #14532d; color: #86efac; padding: 10px 16px; border-radius: 20px; font-size: 13px; font-weight: 600; text-align: center; margin-bottom: 12px; }
-
-    /* Compteur journalier */
-    .daily-counter { display: flex; align-items: center; justify-content: space-between; background: #1e293b; border-radius: 12px; padding: 10px 16px; margin-bottom: 12px; }
-    .counter-text { font-size: 13px; color: #94a3b8; }
-    .counter-bar-wrap { width: 80px; height: 6px; background: #334155; border-radius: 3px; overflow: hidden; }
-    .counter-bar { height: 100%; border-radius: 3px; background: #3b82f6; transition: width 0.3s; }
-    .counter-bar.warn { background: #f59e0b; }
-    .counter-bar.full { background: #ef4444; }
-    .counter-limit { font-size: 12px; font-weight: 700; color: #f1f5f9; }
-
-    /* Bannière Pro */
-    .pro-banner { background: linear-gradient(135deg, rgba(59,130,246,0.15), rgba(6,182,212,0.15)); border: 1px solid rgba(59,130,246,0.3); border-radius: 12px; padding: 12px 16px; margin-bottom: 12px; text-align: center; }
-    .pro-banner-title { font-size: 14px; font-weight: 700; color: #60a5fa; margin-bottom: 4px; }
-    .pro-banner-sub { font-size: 12px; color: #64748b; }
-    .pro-banner-btn { display: inline-block; margin-top: 8px; padding: 8px 16px; background: #3b82f6; color: white; border-radius: 8px; font-size: 12px; font-weight: 600; text-decoration: none; }
-
-    /* Zone upload */
-    .drop-zone { width: 100%; border: 2px dashed #334155; border-radius: 16px; padding: 40px 24px; text-align: center; cursor: pointer; transition: all 0.2s; background: #1e293b; }
-    .drop-zone.disabled { opacity: 0.5; cursor: not-allowed; }
-    .drop-zone.drag-over { border-color: #3b82f6; background: #1e3a5f; }
-    .drop-zone input { display: none; }
-    .drop-icon { font-size: 40px; margin-bottom: 12px; }
-    .drop-text { color: #94a3b8; font-size: 15px; }
-    .drop-text span { color: #3b82f6; font-weight: 600; }
-    .file-list { width: 100%; margin-top: 12px; }
-    .file-item { background: #1e293b; border-radius: 10px; padding: 12px 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; }
-    .file-icon { font-size: 22px; }
-    .file-info { flex: 1; min-width: 0; }
-    .file-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .file-size-t { font-size: 11px; color: #64748b; margin-bottom: 4px; }
-    .progress-bar { width: 100%; height: 6px; background: #334155; border-radius: 3px; overflow: hidden; }
-    .progress-fill { height: 100%; border-radius: 3px; transition: width 0.15s ease; width: 0%; background: linear-gradient(90deg, #3b82f6, #06b6d4); }
-    .progress-fill.done { background: #22c55e; }
-    .progress-fill.error { background: #ef4444; }
-    .progress-label { font-size: 11px; color: #64748b; margin-top: 3px; display: flex; justify-content: space-between; }
-    .file-status { font-size: 18px; }
-    .send-btn { width: 100%; margin-top: 14px; padding: 16px; background: #3b82f6; color: white; border: none; border-radius: 14px; font-size: 16px; font-weight: 600; cursor: pointer; }
-    .send-btn:disabled { background: #334155; cursor: not-allowed; }
-    .result { margin-top: 12px; padding: 12px; border-radius: 10px; font-size: 13px; text-align: center; display: none; }
-    .result.ok { background: #14532d; color: #86efac; }
-    .result.err { background: #450a0a; color: #fca5a5; }
-    .result.limit { background: #451a03; color: #fed7aa; border: 1px solid #92400e; }
-
-    /* Onglets Pro */
-    .tabs { display: flex; background: #1e293b; border-radius: 12px; padding: 4px; gap: 4px; margin-bottom: 12px; }
-    .tab-btn { flex: 1; padding: 10px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
-    .tab-btn.active { background: #3b82f6; color: white; }
-    .tab-btn.inactive { background: transparent; color: #64748b; }
-    .tab-btn.pro-locked { color: #475569; cursor: default; }
-    .dl-item { background: #1e293b; border-radius: 12px; padding: 14px 16px; display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
-    .dl-btn { padding: 10px 16px; background: #3b82f6; color: white; border-radius: 8px; font-size: 13px; font-weight: 600; text-decoration: none; white-space: nowrap; }
-    .refresh-btn { width: 100%; margin-top: 16px; padding: 12px; background: transparent; color: #64748b; border: 1px solid #334155; border-radius: 12px; font-size: 14px; cursor: pointer; }
-    .empty-state { text-align: center; padding: 40px 0; color: #64748b; }
-  </style>
-</head>
-<body>
-  <div class="logo">📁</div>
-  <h1>TransferBridge</h1>
-  <p class="subtitle">Transfert sécurisé · v1.2.0</p>
-
-  <!-- PIN Screen -->
-  <div id="pin-screen">
-    <p class="pin-label">🔐 Saisis le code PIN affiché sur le PC</p>
-    <div class="pin-inputs">
-      <input class="pin-digit" id="p0" type="tel" maxlength="1" inputmode="numeric" autocomplete="one-time-code">
-      <input class="pin-digit" id="p1" type="tel" maxlength="1" inputmode="numeric" autocomplete="off">
-      <input class="pin-digit" id="p2" type="tel" maxlength="1" inputmode="numeric" autocomplete="off">
-      <input class="pin-digit" id="p3" type="tel" maxlength="1" inputmode="numeric" autocomplete="off">
-    </div>
-    <button class="pin-btn" id="pinBtn" onclick="submitPin()">Valider</button>
-    <div class="pin-error" id="pinError">❌ PIN incorrect. Demande un nouveau PIN sur le PC.</div>
-  </div>
-
-  <!-- Upload Screen -->
-  <div id="upload-screen">
-    <div class="connected-badge" id="connectedBadge">✅ Connecté</div>
-
-    <!-- Compteur journalier (gratuit seulement) -->
-    <div class="daily-counter" id="dailyCounter" style="display:none">
-      <div class="counter-text">Envois aujourd'hui</div>
-      <div class="counter-bar-wrap">
-        <div class="counter-bar" id="counterBar"></div>
-      </div>
-      <div class="counter-limit"><span id="counterLeft">10</span>/<span id="counterMax">10</span></div>
-    </div>
-
-    <!-- Bannière Pro quand limite atteinte -->
-    <div class="pro-banner" id="proBanner" style="display:none">
-      <div class="pro-banner-title">🚀 Limite journalière atteinte</div>
-      <div class="pro-banner-sub">Passez à Pro pour des envois illimités, taille illimitée et bien plus.</div>
-      <a href="https://transferbridge.site/checkout.html" target="_blank" class="pro-banner-btn">⚡ Passer à Pro — 19.99€/mois</a>
-    </div>
-
-    <!-- Onglets (Pro seulement) -->
-    <div class="tabs" id="tabs" style="display:none">
-      <button class="tab-btn active" id="tab-receive" onclick="switchTab('receive')">📥 Recevoir</button>
-      <button class="tab-btn inactive" id="tab-download" onclick="switchTab('download')">📤 Du PC</button>
-    </div>
-
-    <!-- Panel Recevoir -->
-    <div id="panel-receive">
-      <div class="drop-zone" id="dropZone">
-        <input type="file" id="fileInput" multiple accept="*/*">
-        <div class="drop-icon">📂</div>
-        <div class="drop-text"><span>Appuie ici</span> pour sélectionner<br>photos, vidéos, PDF, tout type</div>
-      </div>
-      <div class="file-list" id="fileList"></div>
-      <button class="send-btn" id="sendBtn" style="display:none">🚀 Envoyer sur le PC</button>
-      <div class="result" id="result"></div>
-    </div>
-
-    <!-- Panel Télécharger (Pro) -->
-    <div id="panel-download" style="display:none">
-      <div id="dl-empty" class="empty-state">
-        <div style="font-size:40px;margin-bottom:12px">📭</div>
-        <p>Aucun fichier en attente</p>
-        <p style="font-size:12px;margin-top:4px;color:#475569">Envoie des fichiers depuis l'app PC</p>
-      </div>
-      <div id="dl-list"></div>
-      <button class="refresh-btn" onclick="refreshDownloads()">🔄 Actualiser</button>
-    </div>
-  </div>
-
-  <script>
-    let sessionToken = null, selectedFiles = [], ws = null;
-    let planInfo = { plan: 'Gratuit', bidirectional: false, uploads_left: 10, uploads_limit: 10 };
-
-    // ── WebSocket ──
-    function connectWS() {
-      ws = new WebSocket('ws://' + location.host + '/ws');
-      ws.onmessage = e => {
-        try {
-          const data = JSON.parse(e.data);
-          if (data.type === 'plan-info') {
-            planInfo = { ...planInfo, ...data };
-            updatePlanUI();
-          }
-          if (data.type === 'file-queued') {
-            const tab = document.getElementById('tab-download');
-            if (tab) tab.textContent = '📤 Du PC 🔴';
-            const panel = document.getElementById('panel-download');
-            if (panel && panel.style.display !== 'none') refreshDownloads();
-          }
-        } catch {}
-      };
-      ws.onclose = () => setTimeout(connectWS, 2000);
-    }
-    connectWS();
-
-    function sendProgress(filename, percent) {
-      if (ws && ws.readyState === WebSocket.OPEN)
-        ws.send(JSON.stringify({ type: 'progress', filename, percent }));
-    }
-
-    function updatePlanUI() {
-      const isPro = planInfo.plan !== 'Gratuit';
-      const badge = document.getElementById('connectedBadge');
-      if (badge) {
-        badge.textContent = isPro
-          ? '⚡ ' + planInfo.plan + ' — Connecté'
-          : '✅ Connecté — Plan Gratuit';
-      }
-
-      // Onglets bidirectionnels : Pro seulement
-      const tabs = document.getElementById('tabs');
-      if (tabs) tabs.style.display = isPro ? 'flex' : 'none';
-
-      // Compteur journalier : gratuit seulement
-      const counter = document.getElementById('dailyCounter');
-      const proBanner = document.getElementById('proBanner');
-      if (!isPro && planInfo.uploads_limit) {
-        const left = planInfo.uploads_left ?? 10;
-        const max  = planInfo.uploads_limit ?? 10;
-        const used = max - left;
-
-        counter.style.display = 'flex';
-        document.getElementById('counterLeft').textContent = left;
-        document.getElementById('counterMax').textContent  = max;
-
-        const bar = document.getElementById('counterBar');
-        const pct = (used / max) * 100;
-        bar.style.width = pct + '%';
-        bar.className = 'counter-bar' + (pct >= 100 ? ' full' : pct >= 70 ? ' warn' : '');
-
-        // Bloque si limite atteinte
-        if (left <= 0) {
-          proBanner.style.display = 'block';
-          const dz = document.getElementById('dropZone');
-          dz.classList.add('disabled');
-          dz.onclick = null;
-        } else {
-          proBanner.style.display = 'none';
-        }
-      } else {
-        counter.style.display  = 'none';
-        proBanner.style.display = 'none';
-      }
-    }
-
-    // ── PIN ──
-    const digits  = [0,1,2,3].map(i => document.getElementById('p'+i));
-    const pinBtn   = document.getElementById('pinBtn');
-    const pinError = document.getElementById('pinError');
-
-    function refreshPinBtn() {
-      const ok = digits.every(d => d.value.replace(/\D/g,'').length === 1);
-      pinBtn.className = ok ? 'pin-btn active' : 'pin-btn';
-    }
-
-    digits.forEach((el, i) => {
-      function handleChange() {
-        const v = el.value.replace(/\D/g,'').slice(-1);
-        el.value = v;
-        if (v) { el.classList.add('filled'); if (i < 3) digits[i+1].focus(); }
-        else el.classList.remove('filled');
-        refreshPinBtn();
-      }
-      ['input','keyup','change'].forEach(evt => el.addEventListener(evt, handleChange));
-      el.addEventListener('keydown', e => {
-        if (e.key === 'Backspace' && !el.value && i > 0) {
-          digits[i-1].value = ''; digits[i-1].classList.remove('filled'); digits[i-1].focus(); refreshPinBtn();
-        }
-      });
-      el.addEventListener('focus', () => setTimeout(() => el.select(), 50));
-    });
-
-    async function submitPin() {
-      const pin = digits.map(d => d.value.replace(/\D/g,'')).join('');
-      if (pin.length !== 4) return;
-      pinBtn.disabled = true; pinBtn.textContent = '⏳ Vérification...';
-      pinError.style.display = 'none';
-      try {
-        const res  = await fetch('/verify-pin', {
-          method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({pin})
-        });
-        const data = await res.json();
-        if (data.success) {
-          sessionToken = data.token;
-          // Récupère les infos du plan depuis la réponse
-          planInfo = {
-            plan:          data.plan || 'Gratuit',
-            bidirectional: data.bidirectional || false,
-            uploads_left:  data.uploads_left,
-            uploads_limit: data.uploads_limit,
-          };
-          document.getElementById('pin-screen').style.display  = 'none';
-          document.getElementById('upload-screen').style.display = 'block';
-          updatePlanUI();
-        } else throw new Error();
-      } catch {
-        digits.forEach(d => { d.classList.add('error'); d.value = ''; d.classList.remove('filled'); });
-        setTimeout(() => digits.forEach(d => d.classList.remove('error')), 500);
-        pinError.style.display = 'block';
-        pinBtn.disabled = false; pinBtn.textContent = 'Valider'; pinBtn.className = 'pin-btn';
-        digits[0].focus();
-      }
-    }
-
-    // ── Onglets ──
-    function switchTab(tab) {
-      const isReceive = tab === 'receive';
-      document.getElementById('panel-receive').style.display  = isReceive ? 'block' : 'none';
-      document.getElementById('panel-download').style.display = isReceive ? 'none'  : 'block';
-      document.getElementById('tab-receive').className  = isReceive ? 'tab-btn active' : 'tab-btn inactive';
-      document.getElementById('tab-download').className = isReceive ? 'tab-btn inactive' : 'tab-btn active';
-      if (!isReceive) refreshDownloads();
-    }
-
-    // ── Downloads PC → Téléphone (Pro) ──
-    async function refreshDownloads() {
-      try {
-        const res  = await fetch('/files-to-send?token=' + sessionToken);
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        if (data.pro_required) {
-          document.getElementById('dl-list').innerHTML = '';
-          document.getElementById('dl-empty').innerHTML = `
-            <div style="font-size:40px;margin-bottom:12px">⚡</div>
-            <p style="font-weight:700;color:#f1f5f9">Fonctionnalité Pro</p>
-            <p style="font-size:12px;margin-top:4px">Le transfert PC → Téléphone est réservé aux abonnés Pro.</p>
-            <a href="https://transferbridge.site/checkout.html" target="_blank" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#3b82f6;color:white;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none">⚡ Passer à Pro</a>
-          `;
-          document.getElementById('dl-empty').style.display = 'block';
-          return;
-        }
-        renderDownloads(data.files || []);
-      } catch { renderDownloads([]); }
-    }
-
-    function renderDownloads(files) {
-      const empty = document.getElementById('dl-empty');
-      const list  = document.getElementById('dl-list');
-      if (!files || !files.length) {
-        empty.innerHTML = `<div style="font-size:40px;margin-bottom:12px">📭</div><p>Aucun fichier en attente</p><p style="font-size:12px;margin-top:4px;color:#475569">Envoie des fichiers depuis l'app PC</p>`;
-        empty.style.display='block'; list.innerHTML=''; return;
-      }
-      empty.style.display = 'none';
-      list.innerHTML = files.map(f => `
-        <div class="dl-item">
-          <span style="font-size:24px">${getIcon(f.name)}</span>
-          <div style="flex:1;min-width:0">
-            <div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${f.name}</div>
-            <div style="font-size:11px;color:#64748b;margin-top:2px">${fmtSize(f.size)}</div>
-          </div>
-          <a href="/send/${f.id}?token=${sessionToken}" download="${f.name}" class="dl-btn">⬇️</a>
-        </div>`).join('');
-    }
-
-    // ── Upload Téléphone → PC ──
-    const dropZone = document.getElementById('dropZone');
-    const fileInput = document.getElementById('fileInput');
-    const fileList  = document.getElementById('fileList');
-    const sendBtn   = document.getElementById('sendBtn');
-    const result    = document.getElementById('result');
-
-    dropZone.addEventListener('click', () => {
-      if (dropZone.classList.contains('disabled')) return;
-      fileInput.click();
-    });
-    fileInput.addEventListener('change', e => addFiles(e.target.files));
-    dropZone.addEventListener('dragover', e => { e.preventDefault(); if(!dropZone.classList.contains('disabled')) dropZone.classList.add('drag-over'); });
-    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-    dropZone.addEventListener('drop', e => {
-      e.preventDefault(); dropZone.classList.remove('drag-over');
-      if (!dropZone.classList.contains('disabled')) addFiles(e.dataTransfer.files);
-    });
-
-    function getIcon(n) {
-      const e = n.split('.').pop().toLowerCase();
-      if (['jpg','jpeg','png','gif','webp','heic'].includes(e)) return '🖼️';
-      if (['mp4','mov','avi','mkv'].includes(e)) return '🎬';
-      if (e==='pdf') return '📄'; if (['zip','rar','7z'].includes(e)) return '🗜️';
-      if (['mp3','wav','aac'].includes(e)) return '🎵'; return '📎';
-    }
-    function fmtSize(b) {
-      if (b<1024) return b+' o'; if (b<1048576) return (b/1024).toFixed(1)+' Ko';
-      return (b/1048576).toFixed(1)+' Mo';
-    }
-    function addFiles(files) {
-      // Vérifie la limite
-      const left = planInfo.uploads_left;
-      if (left !== null && left !== undefined && left <= 0) {
-        document.getElementById('proBanner').style.display = 'block';
-        return;
-      }
-      for (const f of files) selectedFiles.push(f);
-      render(); sendBtn.style.display = selectedFiles.length ? 'block' : 'none'; result.style.display='none';
-    }
-    function render() {
-      fileList.innerHTML = selectedFiles.map((f,i) => `
-        <div class="file-item">
-          <div class="file-icon">${getIcon(f.name)}</div>
-          <div class="file-info">
-            <div class="file-name">${f.name}</div>
-            <div class="file-size-t">${fmtSize(f.size)}</div>
-            <div class="progress-bar"><div class="progress-fill" id="pf-${i}"></div></div>
-            <div class="progress-label"><span id="pl-${i}">En attente</span><span id="pp-${i}">0%</span></div>
-          </div>
-          <div class="file-status" id="st-${i}">⏳</div>
-        </div>`).join('');
-    }
-
-    function uploadFile(file, index) {
-      return new Promise((resolve, reject) => {
-        const fd = new FormData(); fd.append('token', sessionToken); fd.append('file', file, file.name);
-        const xhr = new XMLHttpRequest();
-        xhr.upload.addEventListener('progress', e => {
-          if (!e.lengthComputable) return;
-          const pct = Math.round((e.loaded/e.total)*100);
-          const fill=document.getElementById('pf-'+index), label=document.getElementById('pl-'+index), pctEl=document.getElementById('pp-'+index);
-          if(fill) fill.style.width=pct+'%'; if(label) label.textContent=pct<100?'Envoi...':'Finalisation...'; if(pctEl) pctEl.textContent=pct+'%';
-          sendProgress(file.name, pct);
-        });
-        xhr.addEventListener('load', () => {
-          if (xhr.status>=200 && xhr.status<300) {
-            const fill=document.getElementById('pf-'+index), label=document.getElementById('pl-'+index);
-            const pctEl=document.getElementById('pp-'+index), status=document.getElementById('st-'+index);
-            if(fill){fill.style.width='100%';fill.classList.add('done');} if(label) label.textContent='Envoyé !';
-            if(pctEl) pctEl.textContent='100%'; if(status) status.textContent='✅';
-            // Met à jour le compteur
-            if (planInfo.uploads_left !== null && planInfo.uploads_left !== undefined) {
-              planInfo.uploads_left = Math.max(0, planInfo.uploads_left - 1);
-              updatePlanUI();
-            }
-            resolve();
-          } else if (xhr.status===429) {
-            // Limite journalière
-            result.style.display='block';
-            result.className='result limit';
-            result.textContent='⏳ Limite de 10 envois/jour atteinte. Revenez demain ou passez à Pro !';
-            if (planInfo.uploads_left !== null) planInfo.uploads_left = 0;
-            updatePlanUI();
-            reject(new Error('Limite atteinte'));
-          } else if (xhr.status===413) {
-            const fill=document.getElementById('pf-'+index), label=document.getElementById('pl-'+index), status=document.getElementById('st-'+index);
-            if(fill) fill.classList.add('error'); if(label) label.textContent='❌ Trop lourd'; if(status) status.textContent='❌';
-            reject(new Error('Trop lourd'));
-          } else if (xhr.status===401) {
-            document.getElementById('upload-screen').style.display='none';
-            document.getElementById('pin-screen').style.display='block';
-            pinError.textContent='⚠️ Session expirée. Saisis le nouveau PIN.'; pinError.style.display='block';
-            reject(new Error('Session expirée'));
-          } else reject(new Error('Erreur serveur'));
-        });
-        xhr.addEventListener('error', () => {
-          const fill=document.getElementById('pf-'+index), status=document.getElementById('st-'+index);
-          if(fill) fill.classList.add('error'); if(status) status.textContent='❌'; reject(new Error('Erreur réseau'));
-        });
-        xhr.open('POST', '/upload'); xhr.send(fd);
-      });
-    }
-
-    sendBtn.addEventListener('click', async () => {
-      sendBtn.disabled=true; sendBtn.textContent='⏳ Envoi en cours...';
-      let allOk=true;
-      for (let i=0; i<selectedFiles.length; i++) { try { await uploadFile(selectedFiles[i],i); } catch { allOk=false; } }
-      result.style.display='block';
-      if (allOk) {
-        result.className='result ok'; result.textContent='✅ Tous les fichiers ont été envoyés !';
-        selectedFiles=[];
-        setTimeout(()=>{ render(); sendBtn.style.display='none'; sendBtn.disabled=false; sendBtn.textContent='🚀 Envoyer sur le PC'; }, 2000);
-      } else if (result.className !== 'result limit') {
-        result.className='result err'; result.textContent="❌ Certains fichiers ont échoué.";
-        sendBtn.disabled=false; sendBtn.textContent='🔄 Réessayer';
-      }
-    });
-  </script>
-</body>
-</html>"#;
+const MOBILE_UI: &str = include_str!("mobile_ui.html");
 
 // ─── Cloudflare Tunnel ────────────────────────────────────────────
 
@@ -1681,8 +1300,8 @@ async fn launch_tunnel(
             if let Some(url) = extract_tunnel_url(&line) {
                 println!("🌐 Tunnel URL : {}", url);
 
-                *tunnel_url_clone.lock().unwrap() = Some(url.clone());
-                *tunnel_active_clone.lock().unwrap() = true;
+                *tunnel_url_clone.lock().unwrap_or_else(|e| e.into_inner()) = Some(url.clone());
+                *tunnel_active_clone.lock().unwrap_or_else(|e| e.into_inner()) = true;
 
                 // Notifie React
                 let _ = app_clone.emit("tunnel-ready", serde_json::json!({
@@ -1701,8 +1320,8 @@ async fn launch_tunnel(
         }
 
         // Le processus s'est arrêté
-        *tunnel_active_clone.lock().unwrap() = false;
-        *tunnel_url_clone.lock().unwrap() = None;
+        *tunnel_active_clone.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *tunnel_url_clone.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let _ = app_clone.emit("tunnel-stopped", serde_json::json!({ "active": false }));
         println!("☁️  Tunnel Cloudflare arrêté");
     });
@@ -1738,8 +1357,8 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
 async fn get_tunnel_status(
     global: tauri::State<'_, GlobalState>,
 ) -> Result<serde_json::Value, String> {
-    let active = *global.tunnel_active.lock().unwrap();
-    let url    = global.tunnel_url.lock().unwrap().clone();
+    let active = *global.tunnel_active.lock().unwrap_or_else(|e| e.into_inner());
+    let url    = global.tunnel_url.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     Ok(serde_json::json!({
         "active": active,
@@ -1754,7 +1373,7 @@ async fn stop_tunnel(
 ) -> Result<(), String> {
     // Extrait le Child du Mutex AVANT le .await (MutexGuard n'est pas Send)
     let child_opt = {
-        let mut process = global.tunnel_process.lock().unwrap();
+        let mut process = global.tunnel_process.lock().unwrap_or_else(|e| e.into_inner());
         process.take()
     };
 
@@ -1763,8 +1382,8 @@ async fn stop_tunnel(
         println!("☁️  Tunnel Cloudflare arrêté manuellement");
     }
 
-    *global.tunnel_active.lock().unwrap() = false;
-    *global.tunnel_url.lock().unwrap() = None;
+    *global.tunnel_active.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *global.tunnel_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let _ = app.emit("tunnel-stopped", serde_json::json!({ "active": false }));
     Ok(())
 }
@@ -1776,7 +1395,7 @@ async fn restart_tunnel(
 ) -> Result<(), String> {
     // Extrait le Child du Mutex AVANT le .await (MutexGuard n'est pas Send)
     let child_opt = {
-        let mut process = global.tunnel_process.lock().unwrap();
+        let mut process = global.tunnel_process.lock().unwrap_or_else(|e| e.into_inner());
         process.take()
     };
 
@@ -1784,11 +1403,11 @@ async fn restart_tunnel(
         let _ = child.kill().await;
     }
 
-    *global.tunnel_active.lock().unwrap() = false;
-    *global.tunnel_url.lock().unwrap() = None;
+    *global.tunnel_active.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *global.tunnel_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
     // Relance — clone tout ce dont on a besoin avant le .await
-    let plan = global.plan.lock().unwrap().clone();
+    let plan = global.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if plan.allows_bidirectional() {
         let tunnel_url_arc    = Arc::clone(&global.tunnel_url);
         let tunnel_active_arc = Arc::clone(&global.tunnel_active);
@@ -1801,7 +1420,7 @@ async fn restart_tunnel(
             tunnel_active_arc,
         ).await?;
 
-        *global.tunnel_process.lock().unwrap() = Some(child);
+        *global.tunnel_process.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
         let _ = app.emit("tunnel-starting", true);
     }
 
@@ -1815,6 +1434,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(GlobalState {
             pin:            Arc::new(Mutex::new(String::new())),
+            pin_attempts:   Arc::new(Mutex::new(PinAttempts::default())),
             sessions:       Arc::new(Mutex::new(vec![])),
             save_dir:       Arc::new(Mutex::new(PathBuf::from("."))),
             started:        Mutex::new(false),

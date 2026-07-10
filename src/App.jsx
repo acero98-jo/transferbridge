@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import QRCode from "qrcode";
 import { languageNames, detectLanguage, getT } from "./i18n/index.js";
+import { formatSize, getFileBadge, getFileType } from "./utils.js";
 import Feedback from "./Feedback.jsx";
 import Updater from "./Updater.jsx";
 import SendToPhone from "./SendToPhone.jsx";
@@ -277,36 +278,6 @@ export default function App() {
   function clearHistory() {
     setFiles([]);
     invoke("save_history", { history: [] }).catch(console.error);
-  }
-
-  function formatSize(bytes) {
-    if (!bytes) return "0 o";
-    if (bytes < 1024) return bytes + " o";
-    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " Ko";
-    return (bytes / 1048576).toFixed(1) + " Mo";
-  }
-
-  function getFileIcon(name) {
-    if (!name) return "📎";
-    const ext = name.split(".").pop().toLowerCase();
-    if (["jpg","jpeg","png","gif","webp","heic"].includes(ext)) return "🖼️";
-    if (["mp4","mov","avi","mkv"].includes(ext)) return "🎬";
-    if (ext === "pdf") return "📄";
-    if (["zip","rar","7z"].includes(ext)) return "🗜️";
-    if (["mp3","wav","aac"].includes(ext)) return "🎵";
-    if (["doc","docx"].includes(ext)) return "📝";
-    if (["xls","xlsx"].includes(ext)) return "📊";
-    return "📎";
-  }
-
-  function getFileType(name) {
-    if (!name) return "other";
-    const ext = name.split(".").pop().toLowerCase();
-    if (["jpg","jpeg","png","gif","webp","heic"].includes(ext)) return "image";
-    if (["mp4","mov","avi","mkv"].includes(ext)) return "video";
-    if (ext === "pdf") return "pdf";
-    if (["mp3","wav","aac"].includes(ext)) return "audio";
-    return "other";
   }
 
   const isFree = planInfo.plan === "free";
@@ -617,22 +588,6 @@ export default function App() {
             </div>
           )}
 
-          {/* Stats */}
-          {files.length > 0 && (
-            <div style={s.statsGrid}>
-              {[
-                { num: files.length, label: t.statsTotal },
-                { num: stats.images, label: t.statsPhotos },
-                { num: stats.videos, label: t.statsVideos },
-                { num: formatSize(totalSize), label: t.statsVolume },
-              ].map((item, i) => (
-                <div key={i} style={s.statItem}>
-                  <span style={s.statNum}>{item.num}</span>
-                  <span style={s.statLabel}>{item.label}</span>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
 
         {/* Panneau droit : historique */}
@@ -697,32 +652,40 @@ export default function App() {
             </div>
           ) : (
             <div style={s.fileList}>
-              {filteredFiles.map((file, i) => (
-                <div key={i} style={s.fileItem}>
-                  <span style={{ fontSize: 22, flexShrink: 0 }}>{getFileIcon(file.name)}</span>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={s.fileName}>{file.name}</div>
-                    <div style={s.fileMeta}>
-                      {formatSize(file.size)}
-                      {file.date && <span> · {file.date}</span>}
-                      {file.time && <span> · {file.time}</span>}
+              {filteredFiles.map((file, i) => {
+                const badge = getFileBadge(file.name);
+                const inProgress = file.progress !== undefined && file.progress < 100;
+                return (
+                  <div key={i} style={s.fileItem}>
+                    <div style={{ ...s.fileBadge, background: badge.bg, color: badge.color }}>
+                      {badge.label}
                     </div>
-                    {file.progress !== undefined && file.progress < 100 && (
-                      <div style={s.progressWrap}>
-                        <div style={s.progressBar}>
-                          <div style={{
-                            ...s.progressFill,
-                            width: `${file.progress}%`,
-                            background: "linear-gradient(90deg, #3b82f6, #06b6d4)"
-                          }} />
-                        </div>
-                        <span style={s.progressLabel}>{file.progress}%</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={s.fileName}>{file.name}</div>
+                      <div style={s.fileMeta}>
+                        {formatSize(file.size)}
+                        {file.date && <span> · {file.date}</span>}
+                        {file.time && <span> · {file.time}</span>}
                       </div>
-                    )}
+                      {inProgress && (
+                        <div style={s.progressWrap}>
+                          <div style={s.progressBar}>
+                            <div style={{
+                              ...s.progressFill,
+                              width: `${file.progress}%`,
+                              background: "linear-gradient(90deg, #3b82f6, #06b6d4)"
+                            }} />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    {inProgress
+                      ? <span style={s.fileProgressPct}>{file.progress}%</span>
+                      : <span style={{ fontSize: 14, flexShrink: 0 }}>✅</span>
+                    }
                   </div>
-                  <span style={{ fontSize: 14, flexShrink: 0 }}>✅</span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
 
@@ -739,6 +702,28 @@ export default function App() {
         </div>
 
       </div>
+
+      {/* ── Bandeau statistiques ── */}
+      {files.length > 0 && (
+        <div style={s.bottomStats}>
+          {[
+            { icon: "📦", num: files.length, label: t.statsTotal, color: "#3b82f6" },
+            { icon: "🖼️", num: stats.images, label: t.statsPhotos, color: "#22c55e" },
+            { icon: "🎬", num: stats.videos, label: t.statsVideos, color: "#a78bfa" },
+            { icon: "💾", num: formatSize(totalSize), label: t.statsVolume, color: "#f59e0b" },
+          ].map((item, i) => (
+            <div key={i} style={s.bottomStatCard}>
+              <div style={{ ...s.bottomStatIcon, background: `${item.color}22`, color: item.color }}>
+                {item.icon}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div style={s.bottomStatNum}>{item.num}</div>
+                <div style={s.bottomStatLabel}>{item.label}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* ── Modals ── */}
       {showFeedback && (
@@ -940,7 +925,7 @@ const s = {
     fontFamily: "monospace", marginBottom: 12, wordBreak: "break-all",
   },
   pinBlock: {
-    background: "#0f172a", borderRadius: 12,
+    background: "#0f172a", borderRadius: 12, border: "1px solid #1e293b",
     padding: "12px 14px", marginTop: 4,
   },
   pinHeader: {
@@ -976,16 +961,25 @@ const s = {
   teaserSub: { fontSize: 11, color: "#475569", marginTop: 1 },
   teaserLock: { fontSize: 16, marginLeft: "auto", flexShrink: 0 },
 
-  statsGrid: {
-    display: "grid", gridTemplateColumns: "repeat(4, 1fr)",
-    gap: 6, marginTop: 14,
+  // Bandeau statistiques (bas de page)
+  bottomStats: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 200px), 1fr))",
+    gap: "clamp(8px, 1.5vw, 14px)", marginTop: "clamp(10px, 2vw, 16px)",
   },
-  statItem: {
-    background: "#0f172a", borderRadius: 10, padding: "8px 4px",
-    display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+  bottomStatCard: {
+    background: "#1e293b", borderRadius: 14,
+    padding: "14px 16px", display: "flex", alignItems: "center", gap: 12,
   },
-  statNum: { fontSize: "clamp(13px, 1.5vw, 16px)", fontWeight: 700, color: "#3b82f6" },
-  statLabel: { fontSize: 9, color: "#64748b", textAlign: "center" },
+  bottomStatIcon: {
+    width: 40, height: 40, borderRadius: 10, flexShrink: 0,
+    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18,
+  },
+  bottomStatNum: {
+    fontSize: "clamp(16px, 2vw, 20px)", fontWeight: 700, color: "#f1f5f9",
+    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+  },
+  bottomStatLabel: { fontSize: 11, color: "#64748b", marginTop: 1 },
 
   searchInput: {
     width: "100%", padding: "7px 11px", background: "#0f172a",
@@ -1003,9 +997,15 @@ const s = {
     maxHeight: "clamp(200px, 40vh, 350px)", overflowY: "auto",
   },
   fileItem: {
-    display: "flex", alignItems: "center", gap: 9,
+    display: "flex", alignItems: "center", gap: 11,
     background: "#0f172a", borderRadius: 10, padding: "9px 11px",
   },
+  fileBadge: {
+    width: 36, height: 36, borderRadius: 9, flexShrink: 0,
+    display: "flex", alignItems: "center", justifyContent: "center",
+    fontSize: 9, fontWeight: 700, letterSpacing: 0.3,
+  },
+  fileProgressPct: { fontSize: 13, fontWeight: 700, color: "#3b82f6", flexShrink: 0 },
   fileName: {
     fontSize: "clamp(11px, 1.3vw, 13px)", fontWeight: 500,
     whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
@@ -1018,7 +1018,6 @@ const s = {
   progressWrap: { marginTop: 3 },
   progressBar: { width: "100%", height: 3, background: "#334155", borderRadius: 2, overflow: "hidden" },
   progressFill: { height: "100%", borderRadius: 2, transition: "width 0.15s ease" },
-  progressLabel: { fontSize: 10, color: "#64748b" },
 
   historyUpsell: {
     display: "flex", alignItems: "center", gap: 8,
