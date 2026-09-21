@@ -1,23 +1,26 @@
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Path, Multipart, State, Query},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Multipart, State, Query},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    http::{Method, StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{Html, Response},
     routing::{get, post},
     Json, Router,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::io::ReaderStream;
-use tower_http::cors::{Any, CorsLayer};
 use tokio::process::Child;
+use tokio::sync::broadcast;
+
+const WORKER_URL: &str = "https://transferbridge-license.abouacero1998.workers.dev";
 
 // ─── Plans ────────────────────────────────────────────────────────
 
@@ -84,7 +87,7 @@ pub struct LicenseData {
 
 // ─── Compteur journalier ──────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DailyCounter {
     pub count:    u32,
     pub day:      String, // "2025-06-13" format YYYY-MM-DD
@@ -126,11 +129,32 @@ fn current_day() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
+fn get_counter_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("counter.json"))
+}
+
+fn load_counter(app: &AppHandle) -> DailyCounter {
+    get_counter_path(app).ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|c| serde_json::from_str::<DailyCounter>(&c).ok())
+        .map(|mut c| { c.reset_if_new_day(); c })
+        .unwrap_or_else(DailyCounter::new)
+}
+
+fn persist_counter(app: &AppHandle, counter: &DailyCounter) {
+    if let (Ok(path), Ok(json)) = (get_counter_path(app), serde_json::to_string(counter)) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 // ─── État partagé ─────────────────────────────────────────────────
 
 struct GlobalState {
     pin:            Arc<Mutex<String>>,
-    pin_attempts:   Arc<Mutex<PinAttempts>>,
+    pin_attempts:   Arc<Mutex<PinGuard>>,
+    events:         broadcast::Sender<String>,
     sessions:       Arc<Mutex<Vec<Session>>>,
     save_dir:       Arc<Mutex<PathBuf>>,
     started:        Mutex<bool>,
@@ -177,10 +201,58 @@ impl PinAttempts {
         }
     }
 
-    fn register_success(&mut self) {
-        self.fail_count = 0;
-        self.locked_until = None;
+}
+
+// Le verrouillage est tenu par IP : un attaquant ne peut plus bloquer le
+// vrai utilisateur en saturant un compteur global. En complément, trop
+// d'échecs cumulés (toutes IP confondues) font tourner le PIN, ce qui
+// plafonne le nombre d'essais utiles à MAX_TOTAL_FAILURES par PIN.
+#[derive(Default)]
+struct PinGuard {
+    per_ip:         HashMap<IpAddr, PinAttempts>,
+    total_failures: u32,
+}
+
+impl PinGuard {
+    const MAX_TOTAL_FAILURES: u32 = 20;
+    const MAX_TRACKED_IPS: usize = 1024;
+
+    fn seconds_locked(&self, ip: IpAddr) -> Option<u64> {
+        self.per_ip.get(&ip).and_then(|a| a.seconds_locked())
     }
+
+    /// Enregistre un échec. Retourne true si le PIN doit être régénéré.
+    fn register_failure(&mut self, ip: IpAddr) -> bool {
+        if self.per_ip.len() >= Self::MAX_TRACKED_IPS && !self.per_ip.contains_key(&ip) {
+            self.per_ip.clear();
+        }
+        self.per_ip.entry(ip).or_default().register_failure();
+        self.total_failures += 1;
+        if self.total_failures >= Self::MAX_TOTAL_FAILURES {
+            *self = PinGuard::default();
+            return true;
+        }
+        false
+    }
+
+    fn register_success(&mut self, ip: IpAddr) {
+        self.per_ip.remove(&ip);
+    }
+}
+
+/// IP réelle du client : derrière le tunnel Cloudflare, toutes les requêtes
+/// arrivent depuis 127.0.0.1 et l'IP d'origine est dans CF-Connecting-IP
+/// (l'en-tête n'est pris en compte que pour une connexion locale).
+fn client_ip(addr: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if addr.ip().is_loopback() {
+        if let Some(ip) = headers.get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        {
+            return ip;
+        }
+    }
+    addr.ip()
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -195,7 +267,8 @@ struct PendingFile {
 #[derive(Clone)]
 struct AppState {
     pin:           Arc<Mutex<String>>,
-    pin_attempts:  Arc<Mutex<PinAttempts>>,
+    pin_attempts:  Arc<Mutex<PinGuard>>,
+    events:        broadcast::Sender<String>,
     sessions:      Arc<Mutex<Vec<Session>>>,
     save_dir:      Arc<Mutex<PathBuf>>,
     app_handle:    AppHandle,
@@ -213,10 +286,29 @@ struct Session {
 
 // ─── Device Fingerprint ───────────────────────────────────────────
 
-fn generate_device_id() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+fn machine_guid() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = std::process::Command::new("reg")
+            .args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("MachineGuid"))
+            .and_then(|l| l.split_whitespace().last())
+            .map(|s| s.to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::fs::read_to_string("/etc/machine-id").ok().map(|s| s.trim().to_string())
+    }
+}
 
+fn generate_device_id() -> String {
     let hostname = hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
@@ -226,26 +318,11 @@ fn generate_device_id() -> String {
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Volume serial / machine-id
-    let machine_extra = {
-        #[cfg(target_os = "windows")]
-        {
-            std::fs::read_to_string("C:\\Windows\\System32\\drivers\\etc\\hosts")
-                .map(|c| c.len().to_string())
-                .unwrap_or_else(|_| "win".to_string())
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            std::fs::read_to_string("/etc/machine-id")
-                .unwrap_or_else(|_| "unix".to_string())
-        }
-    };
+    let machine = machine_guid().unwrap_or_else(|| "unknown".to_string());
 
-    let raw = format!("TB-{}:{}:{}", hostname, username, machine_extra);
-    let mut hasher = DefaultHasher::new();
-    raw.hash(&mut hasher);
-    let h = hasher.finish();
-    format!("TBDEV-{:016X}", h)
+    let digest = Sha256::digest(format!("TB-{}:{}:{}", hostname, username, machine).as_bytes());
+    let short: String = digest.iter().take(8).map(|b| format!("{:02X}", b)).collect();
+    format!("TBDEV-{}", short)
 }
 
 // ─── Commandes Tauri ──────────────────────────────────────────────
@@ -263,7 +340,7 @@ async fn start_server(
             let pin = generate_pin();
             *global.pin.lock().unwrap_or_else(|e| e.into_inner()) = pin.clone();
             global.sessions.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            *global.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()) = PinAttempts::default();
+            *global.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()) = PinGuard::default();
             let _ = app.emit("pin-generated", pin);
             return Ok(format!("http://{}:3030", ip));
         }
@@ -292,12 +369,15 @@ async fn start_server(
         *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = license.plan;
     }
 
+    *global.daily_counter.lock().unwrap_or_else(|e| e.into_inner()) = load_counter(&app);
+
     let pin = generate_pin();
     *global.pin.lock().unwrap_or_else(|e| e.into_inner()) = pin.clone();
 
     let state = AppState {
         pin:           Arc::clone(&global.pin),
         pin_attempts:  Arc::clone(&global.pin_attempts),
+        events:        global.events.clone(),
         sessions:      Arc::clone(&global.sessions),
         save_dir:      Arc::clone(&global.save_dir),
         app_handle:    app.clone(),
@@ -310,11 +390,9 @@ async fn start_server(
     let port = 3030u16;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST])
-        .allow_origin(Any)
-        .allow_headers(Any);
-
+    // Pas de CORS : la page mobile est servie par ce même serveur (même
+    // origine). Sans CORS, un site tiers ouvert dans le navigateur de la
+    // victime ne peut pas lire les réponses de l'API ni forcer le PIN.
     let router = Router::new()
         .route("/",              get(serve_mobile_ui))
         .route("/ping",          get(|| async { "pong" }))
@@ -326,16 +404,18 @@ async fn start_server(
         .route("/plan-info",     get(get_plan_info_route))
         .with_state(state)
         // Plafond de sécurité contre les requêtes anormalement volumineuses
-        // (protège la mémoire du process ; la limite réelle par plan est
-        // appliquée dans handle_upload une fois le champ lu).
-        .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024))
-        .layer(cors);
+        // (la limite réelle par plan est appliquée pendant l'écriture en
+        // flux dans handle_upload).
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024 * 1024));
 
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
                 println!("🚀 Serveur démarré sur {}", addr);
-                axum::serve(listener, router).await.unwrap();
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                ).await.unwrap();
             }
             Err(e) => eprintln!("❌ Port déjà occupé : {}", e),
         }
@@ -390,7 +470,7 @@ async fn regenerate_pin(
     let new_pin = generate_pin();
     *global.pin.lock().unwrap_or_else(|e| e.into_inner()) = new_pin.clone();
     global.sessions.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    *global.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()) = PinAttempts::default();
+    *global.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()) = PinGuard::default();
     let _ = app.emit("pin-generated", new_pin.clone());
     Ok(new_pin)
 }
@@ -513,7 +593,7 @@ async fn activate_license(
         .map_err(|e| e.to_string())?;
 
     let res = client
-        .post("https://transferbridge-license.abouacero1998.workers.dev/")
+        .post(format!("{}/", WORKER_URL))
         .json(&serde_json::json!({
             "key":       key,
             "plan":      plan,
@@ -523,7 +603,7 @@ async fn activate_license(
 
     // Fail-closed : si le serveur ne confirme pas explicitement le succès,
     // on REFUSE l'activation. Plus de bypass possible si le serveur est down.
-    match res {
+    let server_body: serde_json::Value = match res {
         Ok(resp) => {
             let status = resp.status();
             if !status.is_success() {
@@ -540,6 +620,7 @@ async fn activate_license(
             if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
                 return Err("Vérification de licence échouée".to_string());
             }
+            body
         }
         Err(_) => {
             // Le serveur est inaccessible (pas d'internet, Worker down, etc.)
@@ -549,19 +630,33 @@ async fn activate_license(
                     .to_string()
             );
         }
-    }
+    };
+
+    // Le plan et l'expiration décidés par le serveur priment sur ceux
+    // demandés par le client (le Worker peut les renvoyer dans sa réponse).
+    let plan_type = match server_body.get("plan").and_then(|v| v.as_str()) {
+        Some("monthly") => PlanType::Monthly,
+        Some("annual")  => PlanType::Annual,
+        Some("team")    => PlanType::Team,
+        _               => plan_type,
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    // Expiration : mensuel = 30j, annuel = 365j, team = aucune
-    let expires_at = match plan_type {
-        PlanType::Monthly => Some(now + 30 * 24 * 3600),
-        PlanType::Annual  => Some(now + 365 * 24 * 3600),
-        PlanType::Team    => None,
-        PlanType::Free    => None,
+    // Expiration : celle du serveur si fournie, sinon repli local
+    // (mensuel = 30j, annuel = 365j, team = aucune)
+    let expires_at = if server_body.get("expires_at").is_some() {
+        server_body.get("expires_at").and_then(|v| v.as_u64())
+    } else {
+        match plan_type {
+            PlanType::Monthly => Some(now + 30 * 24 * 3600),
+            PlanType::Annual  => Some(now + 365 * 24 * 3600),
+            PlanType::Team    => None,
+            PlanType::Free    => None,
+        }
     };
 
     let license = LicenseData {
@@ -615,6 +710,7 @@ async fn check_license(
             let current_device = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if license.device_id != current_device
                 && license.plan != PlanType::Team {
+                *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = PlanType::Free;
                 return Ok(serde_json::json!({
                     "plan": "free",
                     "valid": false,
@@ -670,6 +766,10 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
 }
 
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
+    use futures_util::StreamExt;
+
+    let mut events = state.events.subscribe();
+
     // Envoie les infos du plan au téléphone dès la connexion
     let plan_info = {
         let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -681,23 +781,25 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     };
     let _ = socket.send(Message::Text(plan_info.to_string().into())).await;
 
-    while let Some(Ok(msg)) = {
-        use futures_util::StreamExt;
-        socket.next().await
-    } {
-        match msg {
-            Message::Text(text) => {
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if data["type"] == "progress" {
-                        let filename = data["filename"].as_str().unwrap_or("").to_string();
-                        let percent  = data["percent"].as_f64().unwrap_or(0.0);
-                        let _ = state.app_handle.emit("upload-progress",
-                            serde_json::json!({ "filename": filename, "percent": percent }));
+    loop {
+        tokio::select! {
+            incoming = socket.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if data["type"] == "progress" {
+                            let filename = data["filename"].as_str().unwrap_or("").to_string();
+                            let percent  = data["percent"].as_f64().unwrap_or(0.0).clamp(0.0, 100.0);
+                            let _ = state.app_handle.emit("upload-progress",
+                                serde_json::json!({ "filename": filename, "percent": percent }));
+                        }
                     }
                 }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                _ => {}
+            },
+            Ok(event) = events.recv() => {
+                if socket.send(Message::Text(event)).await.is_err() { break; }
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 }
@@ -731,11 +833,15 @@ async fn get_plan_info_route(
 
 async fn verify_pin(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers:      HeaderMap,
     Json(body):   Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ip = client_ip(addr, &headers);
+
     // Anti brute-force : refuse toute tentative pendant le verrouillage,
     // sans même comparer le PIN (évite de "gaspiller" une fenêtre de timing).
-    if let Some(retry_after) = state.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()).seconds_locked() {
+    if let Some(retry_after) = state.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()).seconds_locked(ip) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             serde_json::json!({
@@ -751,11 +857,18 @@ async fn verify_pin(
     let correct = state.pin.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     if input != correct {
-        let retry_after = {
+        let (retry_after, rotate) = {
             let mut attempts = state.pin_attempts.lock().unwrap_or_else(|e| e.into_inner());
-            attempts.register_failure();
-            attempts.seconds_locked()
+            let rotate = attempts.register_failure(ip);
+            (attempts.seconds_locked(ip), rotate)
         };
+        if rotate {
+            // Trop d'échecs cumulés : le PIN courant est considéré comme
+            // attaqué, on le remplace (les sessions déjà ouvertes restent).
+            let new_pin = generate_pin();
+            *state.pin.lock().unwrap_or_else(|e| e.into_inner()) = new_pin.clone();
+            let _ = state.app_handle.emit("pin-generated", new_pin);
+        }
         let _ = state.app_handle.emit("pin-failed", &input);
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -768,7 +881,7 @@ async fn verify_pin(
         ));
     }
 
-    state.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()).register_success();
+    state.pin_attempts.lock().unwrap_or_else(|e| e.into_inner()).register_success(ip);
 
     let token = uuid::Uuid::new_v4().to_string();
     state.sessions.lock().unwrap_or_else(|e| e.into_inner()).push(Session {
@@ -805,52 +918,41 @@ async fn handle_upload(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<String, (StatusCode, String)> {
-    let mut token = String::new();
-    let mut files_data: Vec<(String, Vec<u8>)> = vec![];
-    let max_size = *state.max_file_size.lock().unwrap_or_else(|e| e.into_inner());
+    use tokio::io::AsyncWriteExt;
 
-    while let Some(field) = multipart.next_field().await
-        .map_err(|e: axum::extract::multipart::MultipartError| (StatusCode::BAD_REQUEST, e.to_string()))?
-    {
-        let name = field.name().unwrap_or("").to_string();
-        if name == "token" {
-            token = field.text().await
-                .map_err(|e: axum::extract::multipart::MultipartError| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        } else {
-            let filename = field.file_name().unwrap_or("fichier").to_string();
-            let data = field.bytes().await
-                .map_err(|e: axum::extract::multipart::MultipartError| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-            // Vérif taille selon plan
-            let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let plan_max = plan.max_file_size_bytes();
-            let effective_max = if plan_max == 0 { max_size } else { plan_max.min(max_size) };
-
-            if effective_max > 0 && data.len() as u64 > effective_max {
-                let msg = format!("❌ '{}' dépasse la limite ({:.0}MB)", filename, effective_max as f64 / 1_048_576.0);
-                let _ = state.app_handle.emit("upload-error", serde_json::json!({
-                    "filename": filename, "error": "too_large", "message": msg.clone()
-                }));
-                return Err((StatusCode::PAYLOAD_TOO_LARGE, msg));
-            }
-
-            files_data.push((filename, data.to_vec()));
-        }
-    }
-
-    if !is_valid_session(&state.sessions, &token) {
+    let bad = |e: axum::extract::multipart::MultipartError| (StatusCode::BAD_REQUEST, e.to_string());
+    let session_error = || {
         let _ = state.app_handle.emit("upload-error", serde_json::json!({
             "error": "session_expired", "message": "Session expirée — reconnecte-toi"
         }));
-        return Err((StatusCode::UNAUTHORIZED, serde_json::json!({ "error": "session_expired" }).to_string()));
-    }
+        (StatusCode::UNAUTHORIZED, serde_json::json!({ "error": "session_expired" }).to_string())
+    };
 
-    // Vérif limite journalière
-    {
+    // Le champ "token" doit précéder les fichiers : la session est validée
+    // avant d'écrire ou même de lire le moindre octet de fichier.
+    let mut authorized = false;
+
+    while let Some(mut field) = multipart.next_field().await.map_err(bad)? {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "token" {
+            let token = field.text().await.map_err(bad)?;
+            authorized = is_valid_session(&state.sessions, &token);
+            continue;
+        }
+
+        if !authorized {
+            return Err(session_error());
+        }
+
+        let filename = sanitize_filename(field.file_name().unwrap_or("fichier"));
+
+        // Limite journalière vérifiée fichier par fichier, avant l'écriture
         let plan = state.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut counter = state.daily_counter.lock().unwrap_or_else(|e| e.into_inner());
-
-        if !counter.can_upload(plan.max_uploads_per_day()) {
+        let limit_reached = {
+            let mut counter = state.daily_counter.lock().unwrap_or_else(|e| e.into_inner());
+            !counter.can_upload(plan.max_uploads_per_day())
+        };
+        if limit_reached {
             let _ = state.app_handle.emit("upload-error", serde_json::json!({
                 "error":   "daily_limit",
                 "message": "Limite journalière atteinte (10/jour). Passez à Pro pour un accès illimité."
@@ -861,25 +963,69 @@ async fn handle_upload(
             }).to_string()));
         }
 
-        // Incrémente le compteur pour chaque fichier
-        for _ in &files_data {
-            counter.increment();
+        // Plan gratuit : plafonné à 500 Mo (et au réglage utilisateur s'il est
+        // plus bas). Plans payants : illimité.
+        let plan_max = plan.max_file_size_bytes();
+        let user_max = *state.max_file_size.lock().unwrap_or_else(|e| e.into_inner());
+        let effective_max = match (plan_max, user_max) {
+            (0, _) => 0,
+            (p, 0) => p,
+            (p, u) => p.min(u),
+        };
+
+        let dir = state.save_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (mut file, save_path) = create_unique_file(&dir, &filename).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        // Écriture en flux : la mémoire utilisée reste constante quelle que
+        // soit la taille du fichier.
+        let mut written: u64 = 0;
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    discard_partial(file, &save_path).await;
+                    return Err(bad(e));
+                }
+            };
+
+            written += chunk.len() as u64;
+            if effective_max > 0 && written > effective_max {
+                discard_partial(file, &save_path).await;
+                let msg = format!("❌ '{}' dépasse la limite ({:.0}MB)", filename, effective_max as f64 / 1_048_576.0);
+                let _ = state.app_handle.emit("upload-error", serde_json::json!({
+                    "filename": filename, "error": "too_large", "message": msg.clone()
+                }));
+                return Err((StatusCode::PAYLOAD_TOO_LARGE, msg));
+            }
+
+            if let Err(e) = file.write_all(&chunk).await {
+                discard_partial(file, &save_path).await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
         }
+
+        if let Err(e) = file.flush().await {
+            discard_partial(file, &save_path).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+        drop(file);
+
+        {
+            let mut counter = state.daily_counter.lock().unwrap_or_else(|e| e.into_inner());
+            counter.increment();
+            persist_counter(&state.app_handle, &counter);
+        }
+
+        println!("✅ Reçu : {} ({} octets)", filename, written);
+        let _ = state.app_handle.emit("file-received", serde_json::json!({
+            "name": filename, "size": written, "path": save_path.to_string_lossy()
+        }));
     }
 
-    for (filename, data) in files_data {
-        let file_size: usize = data.len();
-        let save_path = {
-            let dir = state.save_dir.lock().unwrap_or_else(|e| e.into_inner());
-            get_unique_path(dir.join(&filename))
-        };
-        tokio::fs::write(&save_path, data.as_slice()).await
-            .map_err(|e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        println!("✅ Reçu : {} ({} octets)", filename, file_size);
-        let _ = state.app_handle.emit("file-received", serde_json::json!({
-            "name": filename, "size": file_size, "path": save_path.to_string_lossy()
-        }));
+    if !authorized {
+        return Err(session_error());
     }
 
     // Envoie le compteur mis à jour
@@ -893,6 +1039,57 @@ async fn handle_upload(
     }));
 
     Ok("✅ Fichiers reçus".to_string())
+}
+
+async fn discard_partial(file: tokio::fs::File, path: &std::path::Path) {
+    drop(file);
+    let _ = tokio::fs::remove_file(path).await;
+}
+
+/// Ne garde que le nom de fichier : retire tout chemin (`..\..\x`, `/etc/x`),
+/// les caractères interdits sous Windows et les noms réservés (CON, NUL…).
+fn sanitize_filename(raw: &str) -> String {
+    let base = raw.rsplit(|c| c == '/' || c == '\\').next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        .take(200)
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches(|c| c == '.' || c == ' ').to_string();
+
+    let stem = cleaned.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
+
+    if cleaned.is_empty() || reserved {
+        "fichier".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Crée le fichier sans jamais écraser un fichier existant : `create_new`
+/// est atomique, donc deux envois simultanés du même nom ne se marchent pas dessus.
+async fn create_unique_file(
+    dir: &std::path::Path,
+    filename: &str,
+) -> std::io::Result<(tokio::fs::File, PathBuf)> {
+    let p = std::path::Path::new(filename);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+
+    let mut i = 0u32;
+    loop {
+        let name = if i == 0 { filename.to_string() } else { format!("{}_{}{}", stem, i, ext) };
+        let candidate = dir.join(&name);
+        match tokio::fs::OpenOptions::new().write(true).create_new(true).open(&candidate).await {
+            Ok(file) => return Ok((file, candidate)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => i += 1,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 async fn list_pending_files(
@@ -952,19 +1149,38 @@ async fn download_file(
 
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
-    let encoded_name = file_info.name.replace(' ', "%20");
 
     let response = axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", encoded_name))
+        .header(header::CONTENT_DISPOSITION, content_disposition(&file_info.name))
         .header(header::CONTENT_LENGTH, file_info.size)
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     println!("📲 Téléchargement : {}", file_info.name);
+    let _ = state.app_handle.emit("file-downloaded", serde_json::json!({
+        "id": file_info.id, "name": file_info.name,
+    }));
     Ok(response)
+}
+
+/// En-tête Content-Disposition sûr : nom ASCII de repli + nom UTF-8 encodé
+/// (RFC 5987). Aucun guillemet ni saut de ligne du nom d'origine ne passe.
+fn content_disposition(name: &str) -> String {
+    let ascii: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') { c } else { '_' })
+        .collect();
+    let mut encoded = String::new();
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') {
+            encoded.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{:02X}", b));
+        }
+    }
+    format!("attachment; filename=\"{}\"; filename*=UTF-8''{}", ascii, encoded)
 }
 
 // ─── Utilitaires ──────────────────────────────────────────────────
@@ -973,19 +1189,6 @@ fn generate_pin() -> String {
     use rand::Rng;
     let n: u32 = rand::thread_rng().gen_range(0..10_000);
     format!("{:04}", n)
-}
-
-fn get_unique_path(path: PathBuf) -> PathBuf {
-    if !path.exists() { return path; }
-    let stem   = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-    let ext    = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    let parent = path.parent().unwrap_or(std::path::Path::new("."));
-    let mut i  = 1;
-    loop {
-        let p = parent.join(format!("{}_{}{}", stem, i, ext));
-        if !p.exists() { return p; }
-        i += 1;
-    }
 }
 
 fn get_local_ip() -> String {
@@ -1064,47 +1267,36 @@ struct FeedbackPayload {
 
 #[tauri::command]
 async fn send_feedback(payload: FeedbackPayload) -> Result<String, String> {
-    let stars = match payload.rating {
-        5 => "⭐⭐⭐⭐⭐", 4 => "⭐⭐⭐⭐", 3 => "⭐⭐⭐", 2 => "⭐⭐", _ => "⭐",
-    };
-    let category_emoji = match payload.category.as_str() {
-        "bug" => "🐛 Bug", "feature" => "💡 Idée",
-        "performance" => "⚡ Performance", "ux" => "🎨 UX/Design", _ => "💬 Général",
-    };
-    let email_str = payload.email
-        .filter(|e| !e.is_empty())
-        .map(|e| format!("`{}`", e))
-        .unwrap_or_else(|| "*Anonyme*".to_string());
+    if !(1..=5).contains(&payload.rating) {
+        return Err("Note invalide".to_string());
+    }
+    let message: String = payload.message.chars().take(1500).collect();
+    if message.trim().is_empty() {
+        return Err("Message vide".to_string());
+    }
 
-    let discord_msg = serde_json::json!({
-        "embeds": [{
-            "title": format!("{} Nouveau feedback TransferBridge", stars),
-            "color": match payload.rating { 5=>0x22C55E, 4=>0x3B82F6, 3=>0xF59E0B, 2=>0xF97316, _=>0xEF4444 },
-            "fields": [
-                { "name": "⭐ Note",       "value": format!("{}/5 {}", payload.rating, stars), "inline": true },
-                { "name": "🏷️ Catégorie", "value": category_emoji, "inline": true },
-                { "name": "💻 OS",         "value": &payload.os, "inline": true },
-                { "name": "📦 Version",    "value": &payload.app_version, "inline": true },
-                { "name": "📧 Email",      "value": email_str, "inline": true },
-                { "name": "💬 Message",    "value": &payload.message, "inline": false },
-            ],
-            "footer": { "text": "TransferBridge Feedback System" },
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        }]
-    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
 
-    let webhook_url = "https://discord.com/api/webhooks/1489240590427099266/0tWrGqPXORR-WtVPLsPiVcx1t6t_Nni0pPjK9kRFeLqsP9vdt5XWvFSeADnSVxc56ele";
-    let client = reqwest::Client::new();
-    let res = client.post(webhook_url)
-        .header("Content-Type", "application/json")
-        .body(discord_msg.to_string())
+    let res = client
+        .post(format!("{}/feedback", WORKER_URL))
+        .json(&serde_json::json!({
+            "rating":      payload.rating,
+            "category":    payload.category.chars().take(30).collect::<String>(),
+            "message":     message,
+            "email":       payload.email.map(|e| e.chars().take(200).collect::<String>()),
+            "app_version": payload.app_version.chars().take(30).collect::<String>(),
+            "os":          payload.os.chars().take(60).collect::<String>(),
+        }))
         .send().await
         .map_err(|e| format!("Erreur réseau : {}", e))?;
 
     if res.status().is_success() {
         Ok("✅ Feedback envoyé ! Merci 🙏".to_string())
     } else {
-        Err(format!("Erreur Discord : {}", res.status()))
+        Err(format!("Erreur serveur : {}", res.status()))
     }
 }
 
@@ -1170,6 +1362,8 @@ async fn queue_file_for_send(
     let _ = app.emit("file-queued", serde_json::json!({
         "id": file_id, "name": filename, "size": metadata.len(),
     }));
+    // Prévient les téléphones connectés (sans révéler le nom du fichier)
+    let _ = global.events.send(serde_json::json!({ "type": "file-queued" }).to_string());
 
     Ok(serde_json::json!({ "id": pending.id, "name": pending.name, "size": pending.size }))
 }
@@ -1208,31 +1402,59 @@ fn get_cloudflared_path(app: &AppHandle) -> Result<PathBuf, String> {
     return Ok(dir.join("cloudflared"));
 }
 
-/// Télécharge cloudflared depuis GitHub si absent
-async fn ensure_cloudflared(app: &AppHandle) -> Result<PathBuf, String> {
-    let path = get_cloudflared_path(app)?;
+// Version épinglée + empreinte SHA-256 (publiée par GitHub pour chaque
+// asset de la release). Pour mettre à jour : changer la version et les
+// empreintes ensemble.
+const CLOUDFLARED_VERSION: &str = "2026.9.1";
 
-    if path.exists() {
-        println!("☁️  cloudflared déjà présent : {:?}", path);
-        return Ok(path);
+#[cfg(target_os = "windows")]
+const CLOUDFLARED_ASSET: (&str, &str) = (
+    "cloudflared-windows-amd64.exe",
+    "2837888cc0f5d58f15b6dc478376de90b4d3ba5241c7947455d1e0a0df429712",
+);
+#[cfg(target_os = "linux")]
+const CLOUDFLARED_ASSET: (&str, &str) = (
+    "cloudflared-linux-amd64",
+    "03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc",
+);
+// macOS : cloudflared est publié en .tgz, non géré pour l'instant
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+const CLOUDFLARED_ASSET: (&str, &str) = ("", "");
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Retourne le chemin de cloudflared en garantissant que le binaire
+/// correspond exactement à la version épinglée (hash vérifié).
+async fn ensure_cloudflared(app: &AppHandle) -> Result<PathBuf, String> {
+    let (asset, expected_hash) = CLOUDFLARED_ASSET;
+    if asset.is_empty() {
+        return Err("Mode Relay cloud non disponible sur ce système".to_string());
     }
 
-    println!("☁️  Téléchargement de cloudflared...");
+    let path = get_cloudflared_path(app)?;
 
-    // URL de la dernière version stable
-    #[cfg(target_os = "windows")]
-    let url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
-    #[cfg(target_os = "macos")]
-    let url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64";
-    #[cfg(target_os = "linux")]
-    let url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
+    if let Ok(existing) = tokio::fs::read(&path).await {
+        if sha256_hex(&existing) == expected_hash {
+            println!("☁️  cloudflared déjà présent et vérifié : {:?}", path);
+            return Ok(path);
+        }
+        println!("☁️  cloudflared présent mais version/empreinte différente, remplacement");
+    }
+
+    println!("☁️  Téléchargement de cloudflared {}...", CLOUDFLARED_VERSION);
+    let url = format!(
+        "https://github.com/cloudflare/cloudflared/releases/download/{}/{}",
+        CLOUDFLARED_VERSION, asset
+    );
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let response = client.get(url)
+    let response = client.get(&url)
         .send().await
         .map_err(|e| format!("Erreur téléchargement cloudflared : {}", e))?;
 
@@ -1243,19 +1465,29 @@ async fn ensure_cloudflared(app: &AppHandle) -> Result<PathBuf, String> {
     let bytes = response.bytes().await
         .map_err(|e| e.to_string())?;
 
-    tokio::fs::write(&path, &bytes).await
+    if sha256_hex(&bytes) != expected_hash {
+        return Err("Empreinte de cloudflared invalide : binaire rejeté".to_string());
+    }
+
+    // Écriture dans un fichier temporaire puis renommage : un téléchargement
+    // interrompu ne laisse jamais un exécutable partiel à l'emplacement final.
+    let tmp = path.with_extension("download");
+    tokio::fs::write(&tmp, &bytes).await
         .map_err(|e| e.to_string())?;
 
     // Rendre exécutable sur Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
+        let mut perms = std::fs::metadata(&tmp).map_err(|e| e.to_string())?.permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&tmp, perms).map_err(|e| e.to_string())?;
     }
 
-    println!("✅ cloudflared téléchargé : {:?}", path);
+    tokio::fs::rename(&tmp, &path).await
+        .map_err(|e| e.to_string())?;
+
+    println!("✅ cloudflared téléchargé et vérifié : {:?}", path);
     Ok(path)
 }
 
@@ -1434,7 +1666,8 @@ pub fn run() {
     tauri::Builder::default()
         .manage(GlobalState {
             pin:            Arc::new(Mutex::new(String::new())),
-            pin_attempts:   Arc::new(Mutex::new(PinAttempts::default())),
+            pin_attempts:   Arc::new(Mutex::new(PinGuard::default())),
+            events:         broadcast::channel(16).0,
             sessions:       Arc::new(Mutex::new(vec![])),
             save_dir:       Arc::new(Mutex::new(PathBuf::from("."))),
             started:        Mutex::new(false),
@@ -1478,4 +1711,68 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_paths() {
+        assert_eq!(sanitize_filename(r"..\..\Startup\evil.bat"), "evil.bat");
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename(r"C:\Windows\x.dll"), "x.dll");
+        assert_eq!(sanitize_filename("photo 1.jpg"), "photo 1.jpg");
+    }
+
+    #[test]
+    fn sanitize_rejects_reserved_and_empty() {
+        assert_eq!(sanitize_filename(""), "fichier");
+        assert_eq!(sanitize_filename(".."), "fichier");
+        assert_eq!(sanitize_filename("dir/"), "fichier");
+        assert_eq!(sanitize_filename("NUL.txt"), "fichier");
+        assert_eq!(sanitize_filename("com1"), "fichier");
+        assert_eq!(sanitize_filename("a<b>:c?.txt"), "abc.txt");
+    }
+
+    #[test]
+    fn content_disposition_blocks_injection() {
+        let h = content_disposition("a\"\r\nX-Evil: 1.txt");
+        assert!(!h.contains('\r') && !h.contains('\n'));
+        assert_eq!(h.matches('"').count(), 2);
+        assert!(h.contains("filename*=UTF-8''"));
+    }
+
+    #[test]
+    fn pin_lock_is_per_ip() {
+        let a: IpAddr = "192.168.1.10".parse().unwrap();
+        let b: IpAddr = "192.168.1.11".parse().unwrap();
+        let mut g = PinGuard::default();
+        for _ in 0..PinAttempts::MAX_ATTEMPTS {
+            g.register_failure(a);
+        }
+        assert!(g.seconds_locked(a).is_some());
+        assert!(g.seconds_locked(b).is_none());
+    }
+
+    #[test]
+    fn pin_rotates_after_too_many_total_failures() {
+        let mut g = PinGuard::default();
+        let mut rotated = false;
+        for i in 0..PinGuard::MAX_TOTAL_FAILURES {
+            let ip: IpAddr = format!("10.0.0.{}", i + 1).parse().unwrap();
+            rotated = g.register_failure(ip);
+        }
+        assert!(rotated);
+        assert_eq!(g.total_failures, 0);
+    }
+
+    #[test]
+    fn cf_connecting_ip_only_trusted_from_loopback() {
+        let mut h = HeaderMap::new();
+        h.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.50:5000".parse().unwrap();
+        assert_eq!(client_ip(local, &h), "203.0.113.7".parse::<IpAddr>().unwrap());
+        assert_eq!(client_ip(lan, &h), "192.168.1.50".parse::<IpAddr>().unwrap());
+    }
 }

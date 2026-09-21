@@ -155,9 +155,15 @@
     let sessionToken = null, selectedFiles = [], ws = null;
     let planInfo = { plan: 'Gratuit', bidirectional: false, uploads_left: 10, uploads_limit: 10 };
 
+    // Échappe le HTML : les noms de fichiers sont contrôlés par un tiers
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
     // ── WebSocket ──
     function connectWS() {
-      ws = new WebSocket('ws://' + location.host + '/ws');
+      // wss:// quand la page est en HTTPS (tunnel Cloudflare), sinon le navigateur bloque la connexion
+      ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
       ws.onmessage = e => {
         try {
           const data = JSON.parse(e.data);
@@ -308,7 +314,7 @@
     // ── Downloads PC → Téléphone (Pro) ──
     async function refreshDownloads() {
       try {
-        const res  = await fetch('/files-to-send?token=' + sessionToken);
+        const res  = await fetch('/files-to-send?token=' + encodeURIComponent(sessionToken));
         if (!res.ok) throw new Error();
         const data = await res.json();
         if (data.pro_required) {
@@ -338,10 +344,10 @@
         <div class="dl-item">
           <span style="font-size:24px">${getIcon(f.name)}</span>
           <div style="flex:1;min-width:0">
-            <div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${f.name}</div>
+            <div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(f.name)}</div>
             <div style="font-size:11px;color:#64748b;margin-top:2px">${fmtSize(f.size)}</div>
           </div>
-          <a href="/send/${f.id}?token=${sessionToken}" download="${f.name}" class="dl-btn">⬇️</a>
+          <a href="/send/${encodeURIComponent(f.id)}?token=${encodeURIComponent(sessionToken)}" download="${esc(f.name)}" class="dl-btn">⬇️</a>
         </div>`).join('');
     }
 
@@ -390,7 +396,7 @@
         <div class="file-item">
           <div class="file-icon">${getIcon(f.name)}</div>
           <div class="file-info">
-            <div class="file-name">${f.name}</div>
+            <div class="file-name">${esc(f.name)}</div>
             <div class="file-size-t">${fmtSize(f.size)}</div>
             <div class="progress-bar"><div class="progress-fill" id="pf-${i}"></div></div>
             <div class="progress-label"><span id="pl-${i}">En attente</span><span id="pp-${i}">0%</span></div>

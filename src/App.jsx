@@ -186,6 +186,16 @@ export default function App() {
       const info = await invoke("get_plan_info");
       setPlanInfo(info);
 
+      // Plan gratuit : l'historique est limité à 7 jours
+      if (info.plan === "free" && Array.isArray(history) && history.length > 0) {
+        const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+        const recent = history.filter(f => !f.timestamp || f.timestamp >= cutoff);
+        if (recent.length !== history.length) {
+          setFiles(recent);
+          invoke("save_history", { history: recent }).catch(console.error);
+        }
+      }
+
       // Charge la config APRÈS
       const config = await invoke("get_config");
       setMaxSizeMb(config.max_file_size_mb);
