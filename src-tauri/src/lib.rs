@@ -7,6 +7,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -64,6 +66,16 @@ impl PlanType {
         }
     }
 
+    /// Identifiant stable (indépendant de la langue) : "free", "monthly", "annual", "team"
+    pub fn id(&self) -> &'static str {
+        match self {
+            PlanType::Free => "free",
+            PlanType::Monthly => "monthly",
+            PlanType::Annual => "annual",
+            PlanType::Team => "team",
+        }
+    }
+
     pub fn label(&self) -> &str {
         match self {
             PlanType::Free => "Gratuit",
@@ -83,6 +95,11 @@ pub struct LicenseData {
     pub device_id:  String,
     pub expires_at: Option<u64>, // timestamp unix, None = pas d'expiration
     pub activated_at: u64,
+    /// Jeton signé par le Worker : seule source de vérité pour plan/appareil/expiration
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub last_checked: u64,
 }
 
 // ─── Compteur journalier ──────────────────────────────────────────
@@ -364,9 +381,13 @@ async fn start_server(
         .unwrap_or_else(|_| PathBuf::from("."));
     *global.save_dir.lock().unwrap_or_else(|e| e.into_inner()) = save_dir;
 
-    // Charge la licence si elle existe
+    // Charge la licence si elle existe : le plan n'est accordé que si le jeton
+    // signé est valide pour cet appareil (sinon check_license tranchera).
     if let Ok(license) = load_license_data(&app).await {
-        *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = license.plan;
+        let device_id = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Ok(plan) = evaluate_license(&license, &device_id, unix_now()) {
+            *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = plan;
+        }
     }
 
     *global.daily_counter.lock().unwrap_or_else(|e| e.into_inner()) = load_counter(&app);
@@ -555,12 +576,192 @@ fn get_plan_info(
 
 // ─── Licence ──────────────────────────────────────────────────────
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 async fn load_license_data(app: &AppHandle) -> Result<LicenseData, String> {
     let path = get_license_path(app)?;
     if !path.exists() { return Err("Pas de licence".to_string()); }
     let content = tokio::fs::read_to_string(&path).await
         .map_err(|e: std::io::Error| e.to_string())?;
     serde_json::from_str(&content).map_err(|e| e.to_string())
+}
+
+async fn write_license(app: &AppHandle, license: &LicenseData) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(license).map_err(|e| e.to_string())?;
+    let path = get_license_path(app)?;
+    tokio::fs::write(&path, json.as_bytes()).await
+        .map_err(|e: std::io::Error| e.to_string())
+}
+
+async fn remove_license(app: &AppHandle) {
+    if let Ok(path) = get_license_path(app) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+// ── Licences signées ──────────────────────────────────────────────
+// Le Worker signe (Ed25519) un jeton {v, key, plan, device_id, iat, exp}.
+// L'app ne se fie qu'à ce jeton : le plan, l'appareil et l'expiration
+// viennent de la partie signée, jamais des autres champs de license.json
+// (que l'utilisateur peut modifier).
+
+/// Clé publique Ed25519 (32 octets en base64) qui vérifie les jetons du Worker.
+const LICENSE_PUBLIC_KEY_B64: &str = "WhWLZ6v6X0HA2b9qnwDcovLovBVhZ6lNIm9Kudx2BF8=";
+
+const LICENSE_RECHECK_SECS: u64 = 24 * 3600;
+
+#[derive(Debug, serde::Deserialize)]
+struct LicenseToken {
+    v:         u8,
+    key:       String,
+    plan:      PlanType,
+    device_id: String,
+    iat:       u64,
+    exp:       Option<u64>,
+}
+
+fn verify_license_token_with(token: &str, vk: &VerifyingKey) -> Result<LicenseToken, String> {
+    let (body_b64, sig_b64) = token.split_once('.').ok_or("jeton mal formé")?;
+    let sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).map_err(|_| "signature illisible")?;
+    let sig = Signature::from_slice(&sig_bytes).map_err(|_| "signature invalide")?;
+    vk.verify(body_b64.as_bytes(), &sig).map_err(|_| "signature invalide")?;
+
+    let body = URL_SAFE_NO_PAD.decode(body_b64).map_err(|_| "jeton illisible")?;
+    let token: LicenseToken = serde_json::from_slice(&body).map_err(|_| "jeton invalide")?;
+    if token.v != 1 || token.plan == PlanType::Free {
+        return Err("jeton non supporté".to_string());
+    }
+    Ok(token)
+}
+
+fn license_verifying_key() -> Result<VerifyingKey, String> {
+    let bytes = STANDARD.decode(LICENSE_PUBLIC_KEY_B64)
+        .map_err(|_| "clé publique de licence non configurée".to_string())?;
+    let arr: [u8; 32] = bytes.try_into()
+        .map_err(|_| "clé publique de licence invalide".to_string())?;
+    VerifyingKey::from_bytes(&arr).map_err(|_| "clé publique de licence invalide".to_string())
+}
+
+#[derive(Debug, PartialEq)]
+enum LicenseIssue {
+    NoToken,
+    Invalid,
+    WrongDevice,
+    Expired,
+}
+
+fn evaluate_license_with(
+    vk: &VerifyingKey,
+    license: &LicenseData,
+    device_id: &str,
+    now: u64,
+) -> Result<PlanType, LicenseIssue> {
+    let token = license.token.as_deref().ok_or(LicenseIssue::NoToken)?;
+    let payload = verify_license_token_with(token, vk).map_err(|_| LicenseIssue::Invalid)?;
+    if payload.key != license.key {
+        return Err(LicenseIssue::Invalid);
+    }
+    if payload.device_id != device_id {
+        return Err(LicenseIssue::WrongDevice);
+    }
+    if let Some(exp) = payload.exp {
+        if now > exp {
+            return Err(LicenseIssue::Expired);
+        }
+    }
+    Ok(payload.plan)
+}
+
+/// Plan effectif d'une licence locale, sans réseau (jeton, appareil, expiration).
+fn evaluate_license(license: &LicenseData, device_id: &str, now: u64) -> Result<PlanType, LicenseIssue> {
+    let vk = license_verifying_key().map_err(|_| LicenseIssue::Invalid)?;
+    evaluate_license_with(&vk, license, device_id, now)
+}
+
+fn license_http_client(secs: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(secs))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Demande (ou renouvelle) l'activation auprès du Worker. Renvoie la licence
+/// à enregistrer, ou un code d'erreur stable (voir `licErr` côté interface) :
+/// "not_found", "revoked", "device_limit", "expired", "plan_mismatch",
+/// "server_unreachable", "server_invalid", "generic"…
+async fn request_activation(key: &str, plan_id: &str, device_id: &str) -> Result<LicenseData, String> {
+    let client = license_http_client(15)?;
+
+    let res = client
+        .post(format!("{}/", WORKER_URL))
+        .json(&serde_json::json!({ "key": key, "plan": plan_id, "device_id": device_id }))
+        .send().await
+        // Fail-closed : serveur injoignable → pas d'activation
+        .map_err(|_| "server_unreachable".to_string())?;
+
+    let status = res.status();
+    let body: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+
+    if !status.is_success() {
+        return Err(body.get("code").and_then(|c| c.as_str()).unwrap_or("generic").to_string());
+    }
+    if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return Err("generic".to_string());
+    }
+
+    let token = body.get("token").and_then(|t| t.as_str()).ok_or("server_invalid")?;
+    let payload = verify_license_token_with(token, &license_verifying_key()?)
+        .map_err(|_| "server_invalid".to_string())?;
+    if payload.key != key || payload.device_id != device_id {
+        return Err("server_invalid".to_string());
+    }
+
+    Ok(LicenseData {
+        key:          key.to_string(),
+        plan:         payload.plan,
+        device_id:    device_id.to_string(),
+        expires_at:   payload.exp,
+        activated_at: payload.iat,
+        token:        Some(token.to_string()),
+        last_checked: unix_now(),
+    })
+}
+
+enum RemoteCheck {
+    Valid,
+    Rejected(String),
+    Unreachable,
+}
+
+/// Revalidation légère (révocation, expiration, appareil) sans rien modifier côté serveur.
+async fn remote_check(key: &str, device_id: &str) -> RemoteCheck {
+    let Ok(client) = license_http_client(8) else { return RemoteCheck::Unreachable };
+    let Ok(res) = client
+        .post(format!("{}/license/check", WORKER_URL))
+        .json(&serde_json::json!({ "key": key, "device_id": device_id }))
+        .send().await
+    else { return RemoteCheck::Unreachable };
+
+    let status = res.status();
+    if status.is_success() {
+        return RemoteCheck::Valid;
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let code = res.json::<serde_json::Value>().await.ok()
+            .and_then(|b| b.get("code").and_then(|c| c.as_str()).map(|s| s.to_string()));
+        if let Some(code) = code {
+            if matches!(code.as_str(), "revoked" | "expired" | "not_found" | "bad_signature" | "device_not_registered") {
+                return RemoteCheck::Rejected(code);
+            }
+        }
+    }
+    // 5xx, ancien Worker sans cette route, etc. : on ne pénalise pas l'utilisateur
+    RemoteCheck::Unreachable
 }
 
 #[tauri::command]
@@ -572,110 +773,21 @@ async fn activate_license(
 ) -> Result<(), String> {
     let parts: Vec<&str> = key.split('-').collect();
     if parts.len() != 5 || parts[0] != "TB" {
-        return Err("Format de clé invalide".to_string());
+        return Err("invalid_key_format".to_string());
     }
-
-    let plan_type = match plan.as_str() {
-        "monthly" => PlanType::Monthly,
-        "annual"  => PlanType::Annual,
-        "team"    => PlanType::Team,
-        _         => return Err("Plan inconnu".to_string()),
+    let plan_id = match plan.as_str() {
+        "monthly" | "annual" | "team" => plan.as_str(),
+        _ => return Err("generic".to_string()),
     };
 
     let device_id = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let license = request_activation(&key, plan_id, &device_id).await?;
 
-    // ── Vérification côté serveur — OBLIGATOIRE, fail-closed ──
-    // Pointe vers le Worker Cloudflare qui vérifie la signature HMAC.
-    // Remplace par ton URL réelle de Worker une fois déployé.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let res = client
-        .post(format!("{}/", WORKER_URL))
-        .json(&serde_json::json!({
-            "key":       key,
-            "plan":      plan,
-            "device_id": device_id,
-        }))
-        .send().await;
-
-    // Fail-closed : si le serveur ne confirme pas explicitement le succès,
-    // on REFUSE l'activation. Plus de bypass possible si le serveur est down.
-    let server_body: serde_json::Value = match res {
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
-                // Tente de récupérer le message d'erreur du serveur
-                let err_msg = resp.json::<serde_json::Value>().await
-                    .ok()
-                    .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_else(|| "Clé invalide ou déjà utilisée sur un autre appareil".to_string());
-                return Err(err_msg);
-            }
-            // Vérifie explicitement le champ "success" dans la réponse
-            let body: serde_json::Value = resp.json().await
-                .map_err(|_| "Réponse du serveur de licence invalide".to_string())?;
-            if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
-                return Err("Vérification de licence échouée".to_string());
-            }
-            body
-        }
-        Err(_) => {
-            // Le serveur est inaccessible (pas d'internet, Worker down, etc.)
-            // → on REFUSE par sécurité, contrairement à avant.
-            return Err(
-                "Impossible de vérifier la licence — vérifie ta connexion internet et réessaie."
-                    .to_string()
-            );
-        }
-    };
-
-    // Le plan et l'expiration décidés par le serveur priment sur ceux
-    // demandés par le client (le Worker peut les renvoyer dans sa réponse).
-    let plan_type = match server_body.get("plan").and_then(|v| v.as_str()) {
-        Some("monthly") => PlanType::Monthly,
-        Some("annual")  => PlanType::Annual,
-        Some("team")    => PlanType::Team,
-        _               => plan_type,
-    };
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // Expiration : celle du serveur si fournie, sinon repli local
-    // (mensuel = 30j, annuel = 365j, team = aucune)
-    let expires_at = if server_body.get("expires_at").is_some() {
-        server_body.get("expires_at").and_then(|v| v.as_u64())
-    } else {
-        match plan_type {
-            PlanType::Monthly => Some(now + 30 * 24 * 3600),
-            PlanType::Annual  => Some(now + 365 * 24 * 3600),
-            PlanType::Team    => None,
-            PlanType::Free    => None,
-        }
-    };
-
-    let license = LicenseData {
-        key: key.clone(),
-        plan: plan_type.clone(),
-        device_id,
-        expires_at,
-        activated_at: now,
-    };
-
-    let json = serde_json::to_string_pretty(&license).map_err(|e| e.to_string())?;
-    let path = get_license_path(&app)?;
-    tokio::fs::write(&path, json.as_bytes()).await
-        .map_err(|e: std::io::Error| e.to_string())?;
-
-    *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = plan_type;
+    write_license(&app, &license).await?;
+    *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = license.plan.clone();
 
     let _ = app.emit("plan-changed", license.plan.label());
-    println!("⚡ Plan activé : {}", plan);
+    println!("⚡ Plan activé : {}", license.plan.id());
     Ok(())
 }
 
@@ -684,48 +796,74 @@ async fn check_license(
     app:    AppHandle,
     global: tauri::State<'_, GlobalState>,
 ) -> Result<serde_json::Value, String> {
-    match load_license_data(&app).await {
-        Err(_) => Ok(serde_json::json!({ "plan": "free", "valid": true })),
-        Ok(license) => {
-            // Vérifie l'expiration
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+    let mut license = match load_license_data(&app).await {
+        Err(_) => return Ok(serde_json::json!({ "plan": "free", "valid": true })),
+        Ok(license) => license,
+    };
+    let device_id = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let set_plan = |p: PlanType| *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = p;
 
-            if let Some(exp) = license.expires_at {
-                if now > exp {
-                    // Licence expirée → retour au plan gratuit
-                    *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = PlanType::Free;
-                    let _ = tokio::fs::remove_file(get_license_path(&app)?).await;
-                    return Ok(serde_json::json!({
-                        "plan": "free",
-                        "valid": false,
-                        "expired": true
-                    }));
+    // Licence créée avant les jetons signés : on en récupère un une seule fois.
+    if license.token.is_none() {
+        match request_activation(&license.key, license.plan.id(), &device_id).await {
+            Ok(fresh) => {
+                write_license(&app, &fresh).await?;
+                license = fresh;
+            }
+            Err(code) => {
+                set_plan(PlanType::Free);
+                let offline = code == "server_unreachable";
+                if !offline && code != "server_invalid" && code != "generic" {
+                    remove_license(&app).await;
+                }
+                return Ok(serde_json::json!({
+                    "plan": "free", "valid": false, "needs_online": offline, "code": code,
+                }));
+            }
+        }
+    }
+
+    match evaluate_license(&license, &device_id, unix_now()) {
+        Err(LicenseIssue::Expired) => {
+            set_plan(PlanType::Free);
+            remove_license(&app).await;
+            Ok(serde_json::json!({ "plan": "free", "valid": false, "expired": true }))
+        }
+        Err(LicenseIssue::WrongDevice) => {
+            set_plan(PlanType::Free);
+            Ok(serde_json::json!({ "plan": "free", "valid": false, "wrong_device": true }))
+        }
+        Err(_) => {
+            set_plan(PlanType::Free);
+            Ok(serde_json::json!({ "plan": "free", "valid": false, "invalid": true }))
+        }
+        Ok(plan) => {
+            // Revalidation quotidienne : détecte une licence révoquée ou expirée côté serveur
+            let now = unix_now();
+            if now.saturating_sub(license.last_checked) > LICENSE_RECHECK_SECS {
+                match remote_check(&license.key, &device_id).await {
+                    RemoteCheck::Valid => {
+                        license.last_checked = now;
+                        let _ = write_license(&app, &license).await;
+                    }
+                    RemoteCheck::Rejected(code) => {
+                        set_plan(PlanType::Free);
+                        remove_license(&app).await;
+                        return Ok(serde_json::json!({
+                            "plan": "free", "valid": false, "revoked": true, "code": code,
+                        }));
+                    }
+                    RemoteCheck::Unreachable => {}
                 }
             }
 
-            // Vérifie le device ID
-            let current_device = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if license.device_id != current_device
-                && license.plan != PlanType::Team {
-                *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = PlanType::Free;
-                return Ok(serde_json::json!({
-                    "plan": "free",
-                    "valid": false,
-                    "wrong_device": true
-                }));
-            }
-
-            *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = license.plan.clone();
-
+            set_plan(plan.clone());
             Ok(serde_json::json!({
-                "plan":         license.plan,
-                "plan_label":   license.plan.label(),
-                "valid":        true,
-                "expires_at":   license.expires_at,
-                "key":          license.key,
+                "plan":       plan,
+                "plan_label": plan.label(),
+                "valid":      true,
+                "expires_at": license.expires_at,
+                "key":        license.key,
             }))
         }
     }
@@ -736,11 +874,19 @@ async fn deactivate_license(
     app:    AppHandle,
     global: tauri::State<'_, GlobalState>,
 ) -> Result<(), String> {
-    let path = get_license_path(&app)?;
-    if path.exists() {
-        tokio::fs::remove_file(&path).await
-            .map_err(|e: std::io::Error| e.to_string())?;
+    // Libère l'appareil côté serveur pour pouvoir réutiliser la clé ailleurs
+    // (best effort : sans internet, la désactivation locale a quand même lieu).
+    if let Ok(license) = load_license_data(&app).await {
+        let device_id = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Ok(client) = license_http_client(8) {
+            let _ = client
+                .post(format!("{}/license/deactivate", WORKER_URL))
+                .json(&serde_json::json!({ "key": license.key, "device_id": device_id }))
+                .send().await;
+        }
     }
+
+    remove_license(&app).await;
     *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = PlanType::Free;
     let _ = app.emit("plan-changed", "free");
     println!("🔓 Licence désactivée sur cet appareil");
@@ -777,6 +923,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             "type":           "plan-info",
             "bidirectional":  plan.allows_bidirectional(),
             "plan":           plan.label(),
+            "plan_id":        plan.id(),
         })
     };
     let _ = socket.send(Message::Text(plan_info.to_string().into())).await;
@@ -825,6 +972,7 @@ async fn get_plan_info_route(
 
     Ok(Json(serde_json::json!({
         "plan":          plan.label(),
+        "plan_id":       plan.id(),
         "bidirectional": plan.allows_bidirectional(),
         "uploads_left":  counter.remaining(plan.max_uploads_per_day()),
         "uploads_limit": plan.max_uploads_per_day(),
@@ -902,6 +1050,7 @@ async fn verify_pin(
         "success":       true,
         "token":         token,
         "plan":          plan.label(),
+        "plan_id":       plan.id(),
         "bidirectional": plan.allows_bidirectional(),
         "uploads_left":  counter.remaining(plan.max_uploads_per_day()),
         "uploads_limit": plan.max_uploads_per_day(),
@@ -995,7 +1144,8 @@ async fn handle_upload(
                 discard_partial(file, &save_path).await;
                 let msg = format!("❌ '{}' dépasse la limite ({:.0}MB)", filename, effective_max as f64 / 1_048_576.0);
                 let _ = state.app_handle.emit("upload-error", serde_json::json!({
-                    "filename": filename, "error": "too_large", "message": msg.clone()
+                    "filename": filename, "error": "too_large", "message": msg.clone(),
+                    "limit_mb": effective_max / 1_048_576,
                 }));
                 return Err((StatusCode::PAYLOAD_TOO_LARGE, msg));
             }
@@ -1774,5 +1924,143 @@ mod tests {
         let lan: SocketAddr = "192.168.1.50:5000".parse().unwrap();
         assert_eq!(client_ip(local, &h), "203.0.113.7".parse::<IpAddr>().unwrap());
         assert_eq!(client_ip(lan, &h), "192.168.1.50".parse::<IpAddr>().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod license_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn keypair(seed: u8) -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        (sk, vk)
+    }
+
+    fn make_token(sk: &SigningKey, payload: serde_json::Value) -> String {
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let sig = sk.sign(body.as_bytes());
+        format!("{}.{}", body, URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    fn payload(plan: &str, device: &str, exp: Option<u64>) -> serde_json::Value {
+        serde_json::json!({ "v": 1, "key": "TB-A-B-C-D", "plan": plan, "device_id": device, "iat": 1000, "exp": exp })
+    }
+
+    fn license(token: Option<String>) -> LicenseData {
+        LicenseData {
+            key: "TB-A-B-C-D".into(), plan: PlanType::Monthly, device_id: "D1".into(),
+            expires_at: None, activated_at: 0, token, last_checked: 0,
+        }
+    }
+
+    #[test]
+    fn valid_token_grants_plan_from_signed_payload() {
+        let (sk, vk) = keypair(7);
+        // license.plan dit Monthly, le jeton signé dit Annual : le jeton fait foi
+        let l = license(Some(make_token(&sk, payload("annual", "D1", Some(5000)))));
+        assert_eq!(evaluate_license_with(&vk, &l, "D1", 1000), Ok(PlanType::Annual));
+    }
+
+    #[test]
+    fn editing_license_json_fields_changes_nothing() {
+        let (sk, vk) = keypair(7);
+        let mut l = license(Some(make_token(&sk, payload("monthly", "D1", Some(5000)))));
+        l.plan = PlanType::Team;
+        l.expires_at = None;
+        l.device_id = "D1".into();
+        assert_eq!(evaluate_license_with(&vk, &l, "D1", 1000), Ok(PlanType::Monthly));
+        // Expiration dépassée selon le jeton, même si license.json prétend le contraire
+        assert_eq!(evaluate_license_with(&vk, &l, "D1", 6000), Err(LicenseIssue::Expired));
+    }
+
+    #[test]
+    fn tampered_payload_is_rejected() {
+        let (sk, vk) = keypair(7);
+        let token = make_token(&sk, payload("monthly", "D1", Some(5000)));
+        let sig = token.split_once('.').unwrap().1;
+        let forged_body = URL_SAFE_NO_PAD.encode(payload("team", "D1", None).to_string().as_bytes());
+        let l = license(Some(format!("{}.{}", forged_body, sig)));
+        assert_eq!(evaluate_license_with(&vk, &l, "D1", 1000), Err(LicenseIssue::Invalid));
+    }
+
+    #[test]
+    fn token_signed_with_another_key_is_rejected() {
+        let (attacker, _) = keypair(9);
+        let (_, vk) = keypair(7);
+        let l = license(Some(make_token(&attacker, payload("team", "D1", None))));
+        assert_eq!(evaluate_license_with(&vk, &l, "D1", 1000), Err(LicenseIssue::Invalid));
+    }
+
+    #[test]
+    fn token_is_bound_to_device() {
+        let (sk, vk) = keypair(7);
+        let l = license(Some(make_token(&sk, payload("monthly", "D1", Some(5000)))));
+        assert_eq!(evaluate_license_with(&vk, &l, "AUTRE", 1000), Err(LicenseIssue::WrongDevice));
+    }
+
+    #[test]
+    fn expiry_rules() {
+        let (sk, vk) = keypair(7);
+        let expiring = license(Some(make_token(&sk, payload("monthly", "D1", Some(5000)))));
+        assert!(evaluate_license_with(&vk, &expiring, "D1", 4999).is_ok());
+        assert_eq!(evaluate_license_with(&vk, &expiring, "D1", 5001), Err(LicenseIssue::Expired));
+        let forever = license(Some(make_token(&sk, payload("team", "D1", None))));
+        assert_eq!(evaluate_license_with(&vk, &forever, "D1", u64::MAX / 2), Ok(PlanType::Team));
+    }
+
+    #[test]
+    fn missing_or_foreign_token_is_rejected() {
+        let (sk, vk) = keypair(7);
+        assert_eq!(evaluate_license_with(&vk, &license(None), "D1", 1000), Err(LicenseIssue::NoToken));
+        // jeton d'une autre clé de licence
+        let mut other = payload("monthly", "D1", None);
+        other["key"] = serde_json::json!("TB-X-X-X-X");
+        let l = license(Some(make_token(&sk, other)));
+        assert_eq!(evaluate_license_with(&vk, &l, "D1", 1000), Err(LicenseIssue::Invalid));
+        // un jeton "free" n'a aucun sens
+        let l = license(Some(make_token(&sk, payload("free", "D1", None))));
+        assert_eq!(evaluate_license_with(&vk, &l, "D1", 1000), Err(LicenseIssue::Invalid));
+    }
+
+    #[test]
+    fn malformed_tokens_do_not_panic() {
+        let (_, vk) = keypair(7);
+        for t in ["", ".", "abc", "a.b", "!!!.???", "e30.e30"] {
+            assert!(verify_license_token_with(t, &vk).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod interop_tests {
+    use super::*;
+
+    // Jeton réellement produit par le Worker dans le runtime Cloudflare (workerd),
+    // avec une clé jetable : garantit que la convention de signature du Worker
+    // (Ed25519 sur la chaîne base64url du corps) est bien celle vérifiée par l'app.
+    const WORKER_PUBLIC_KEY_B64: &str = "CJ6WrBjzzuPkiAJiwe1BbVu9Ba/o5naHfwgcdJuG91A=";
+    const WORKER_TOKEN: &str = "eyJ2IjoxLCJrZXkiOiJUQi05OTk5LTk5OTktOTk5OS05OTk5IiwicGxhbiI6ImFubnVhbCIsImRldmljZV9pZCI6IlRCREVWLUxPQ0FMIiwiaWF0IjoxNzkwMDMyMTQ2LCJleHAiOjE4MjE1NjgxNDZ9.s_wzFO6fmFqtD3Ucy4fIcQxMvkqMQ_FBbzZLP2VDRIeRYGlLD9HfgCkUj_9FNApM_EbjY9-iEPsTH1TBTQ5PDQ";
+
+    #[test]
+    fn app_verifies_a_token_signed_by_the_cloudflare_worker() {
+        let bytes = STANDARD.decode(WORKER_PUBLIC_KEY_B64).unwrap();
+        let vk = VerifyingKey::from_bytes(&bytes.try_into().unwrap()).unwrap();
+        let t = verify_license_token_with(WORKER_TOKEN, &vk).expect("signature du Worker acceptée");
+        assert_eq!(t.key, "TB-9999-9999-9999-9999");
+        assert_eq!(t.plan, PlanType::Annual);
+        assert_eq!(t.device_id, "TBDEV-LOCAL");
+        assert_eq!(t.exp, Some(1821568146));
+    }
+}
+
+#[cfg(test)]
+mod key_config_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_license_public_key_is_a_valid_ed25519_key() {
+        license_verifying_key().expect("LICENSE_PUBLIC_KEY_B64 doit être une clé Ed25519 valide");
     }
 }

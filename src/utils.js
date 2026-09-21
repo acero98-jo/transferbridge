@@ -1,8 +1,10 @@
-export function formatSize(bytes) {
-  if (!bytes) return "0 o";
-  if (bytes < 1024) return bytes + " o";
-  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " Ko";
-  return (bytes / 1048576).toFixed(1) + " Mo";
+// units : t.sizeUnits (["o","Ko","Mo","Go"] en français, ["B","KB","MB","GB"] sinon)
+export function formatSize(bytes, units = ["o", "Ko", "Mo", "Go"]) {
+  if (!bytes) return "0 " + units[0];
+  if (bytes < 1024) return bytes + " " + units[0];
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " " + units[1];
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + " " + units[2];
+  return (bytes / 1073741824).toFixed(2) + " " + units[3];
 }
 
 export function getFileIcon(name) {

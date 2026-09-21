@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import QRCode from "qrcode";
-import { languageNames, detectLanguage, getT } from "./i18n/index.js";
+import { languageNames, detectLanguage, getT, fmt } from "./i18n/index.js";
 import { formatSize, getFileBadge, getFileType } from "./utils.js";
 import Feedback from "./Feedback.jsx";
 import Updater from "./Updater.jsx";
@@ -50,8 +50,10 @@ export default function App() {
 
   const filesRef = useRef([]);
   const t = getT(lang);
+  const tRef = useRef(t);
 
   useEffect(() => { filesRef.current = files; }, [files]);
+  useEffect(() => { tRef.current = t; }, [t]);
 
   useEffect(() => {
     async function init() {
@@ -86,11 +88,11 @@ export default function App() {
     const unlistenError = listen("upload-error", (e) => {
       const payload = e.payload;
       if (payload.error === "session_expired") {
-        setSessionError("Session expirée — reconnecte le téléphone");
+        setSessionError({ kind: "session" });
       } else if (payload.error === "too_large") {
-        setSessionError(payload.message);
+        setSessionError({ kind: "too_large", name: payload.filename, mb: payload.limit_mb });
       } else if (payload.error === "daily_limit") {
-        setSessionError("Limite de 10 envois/jour atteinte. Passez à Pro !");
+        setSessionError({ kind: "limit" });
       }
       setTimeout(() => setSessionError(null), 6000);
     });
@@ -224,7 +226,7 @@ export default function App() {
       if (granted) {
         sendNotification({
           title: "📁 TransferBridge",
-          body: `✅ ${filename} (${formatSize(size)})`,
+          body: `✅ ${filename} (${formatSize(size, tRef.current.sizeUnits)})`,
         });
       }
     } catch (e) { console.error(e); }
@@ -232,7 +234,7 @@ export default function App() {
 
   async function chooseSaveDir() {
     try {
-      const selected = await open({ directory: true, multiple: false, title: "Choisir le dossier" });
+      const selected = await open({ directory: true, multiple: false, title: t.chooseFolderTitle });
       if (selected) {
         setSaveDir(selected);
         await invoke("set_save_dir", { path: selected });
@@ -291,6 +293,13 @@ export default function App() {
   }
 
   const isFree = planInfo.plan === "free";
+  const planNames = { free: t.planFree, monthly: t.planMonthly, annual: t.planAnnual, team: t.planTeam };
+  const planName = planNames[planInfo.plan] || planInfo.plan_label;
+  const isLimitError = sessionError?.kind === "limit";
+  const sessionErrorText = !sessionError ? null
+    : sessionError.kind === "session" ? t.errSessionExpired
+    : sessionError.kind === "limit" ? t.errDailyLimit
+    : fmt(t.errTooLarge, { name: sessionError.name || "", mb: sessionError.mb ?? "" });
   const isLimitReached = isFree && planInfo.uploads_left !== null && planInfo.uploads_left <= 0;
   const totalSize = files.reduce((acc, f) => acc + (f.size || 0), 0);
 
@@ -338,7 +347,7 @@ export default function App() {
         {/* Badge plan */}
         {isFree ? (
           <button onClick={() => setShowProModal(true)} style={s.proBtn}>
-            ⚡ Passer Pro
+            {t.upgradePro}
           </button>
         ) : (
           <div style={{
@@ -347,7 +356,7 @@ export default function App() {
             color: planColor.color,
             border: `1px solid ${planColor.border || "transparent"}`,
           }}>
-            ⚡ {planInfo.plan_label}
+            ⚡ {planName}
           </div>
         )}
       </div>
@@ -356,11 +365,11 @@ export default function App() {
       {isFree && (
         <div style={s.freeBanner}>
           <div style={s.freeBannerLeft}>
-            <span style={{ fontSize: 13, color: "#94a3b8" }}>Plan Gratuit</span>
+            <span style={{ fontSize: 13, color: "#94a3b8" }}>{t.freePlanLabel}</span>
             <span style={{ fontSize: 12, color: isLimitReached ? "#ef4444" : "#64748b", marginLeft: 8 }}>
               {isLimitReached
-                ? "⛔ Limite atteinte — revient demain ou passe à Pro"
-                : `${planInfo.uploads_left ?? 10}/${planInfo.uploads_limit ?? 10} envois restants aujourd'hui`
+                ? t.limitReachedBanner
+                : fmt(t.sendsLeft, { left: planInfo.uploads_left ?? 10, max: planInfo.uploads_limit ?? 10 })
               }
             </span>
           </div>
@@ -375,7 +384,7 @@ export default function App() {
               }} />
             </div>
             <button onClick={() => setShowProModal(true)} style={s.upgradeMiniBtn}>
-              ⚡ Upgrade
+              {t.upgradeMini}
             </button>
           </div>
         </div>
@@ -385,14 +394,14 @@ export default function App() {
       {sessionError && (
         <div style={{
           ...s.errorBanner,
-          background: sessionError.includes("Limite") ? "#451a03" : "#450a0a",
-          borderColor: sessionError.includes("Limite") ? "#92400e" : "#7f1d1d",
-          color: sessionError.includes("Limite") ? "#fed7aa" : "#fca5a5",
+          background: isLimitError ? "#451a03" : "#450a0a",
+          borderColor: isLimitError ? "#92400e" : "#7f1d1d",
+          color: isLimitError ? "#fed7aa" : "#fca5a5",
         }}>
-          ⚠️ {sessionError}
-          {sessionError.includes("Limite") && (
+          ⚠️ {sessionErrorText}
+          {isLimitError && (
             <button onClick={() => setShowProModal(true)} style={s.errorProBtn}>
-              ⚡ Passer Pro
+              {t.upgradePro}
             </button>
           )}
         </div>
@@ -408,14 +417,14 @@ export default function App() {
       {/* ── Boutons actions ── */}
       <div style={s.actionRow}>
         <button onClick={() => setShowFeedback(true)} style={s.feedbackBtn}>
-          💬 Feedback
+          {t.feedbackBtn}
         </button>
         <button onClick={() => setShowSettings(!showSettings)} style={s.settingsBtn}>
           ⚙️ {t.settings}
         </button>
         {!isFree && (
-          <button onClick={deactivateLicense} style={s.deactivateBtn} title="Désactiver sur cet appareil">
-            🔓 Déconnecter
+          <button onClick={deactivateLicense} style={s.deactivateBtn} title={t.disconnectTitle}>
+            {t.disconnect}
           </button>
         )}
       </div>
@@ -429,7 +438,7 @@ export default function App() {
             <div>
               <div style={s.settingLabel}>{t.limitLabel}</div>
               <div style={s.settingDesc}>
-                {isFree ? "Gratuit : max 500MB/fichier" : "Pro : illimité"}
+                {isFree ? t.freeLimitDesc : t.proLimitDesc}
               </div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -440,7 +449,7 @@ export default function App() {
                 disabled={!isFree}
                 style={{ ...s.sizeInput, opacity: !isFree ? 0.5 : 1 }}
               />
-              <span style={{ fontSize: 13, color: "#94a3b8" }}>MB</span>
+              <span style={{ fontSize: 13, color: "#94a3b8" }}>{t.sizeUnits[2]}</span>
             </div>
           </div>
 
@@ -452,7 +461,7 @@ export default function App() {
                   background: maxSizeMb === size ? "#3b82f6" : "#0f172a",
                   color: maxSizeMb === size ? "white" : "#64748b",
                 }}>
-                  {size}MB
+                  {size} {t.sizeUnits[2]}
                 </button>
               ))}
             </div>
@@ -461,7 +470,7 @@ export default function App() {
           {/* Infos appareil */}
           {planInfo.device_id && (
             <div style={{ marginTop: 12, padding: "8px 12px", background: "#0f172a", borderRadius: 8 }}>
-              <div style={{ fontSize: 11, color: "#475569" }}>ID appareil</div>
+              <div style={{ fontSize: 11, color: "#475569" }}>{t.deviceId}</div>
               <div style={{ fontSize: 11, fontFamily: "monospace", color: "#64748b", marginTop: 2 }}>
                 {planInfo.device_id}
               </div>
@@ -503,26 +512,26 @@ export default function App() {
             }} />
             <div>
               <div style={s.tunnelTitle}>
-                🌐 Mode Relay cloud
-                {tunnelStatus === "active" && <span style={s.tunnelLiveTag}>EN LIGNE</span>}
+                {t.tunnelTitle}
+                {tunnelStatus === "active" && <span style={s.tunnelLiveTag}>{t.tunnelLive}</span>}
               </div>
               <div style={s.tunnelSub}>
-                {tunnelStatus === "inactive" && "Inactif — démarre automatiquement"}
-                {tunnelStatus === "starting" && "⏳ Établissement du tunnel sécurisé..."}
-                {tunnelStatus === "active" && "Accessible depuis n'importe quel réseau (4G, autre Wi-Fi...)"}
-                {tunnelStatus === "error" && "❌ Erreur — clique sur Relancer"}
+                {tunnelStatus === "inactive" && t.tunnelInactive}
+                {tunnelStatus === "starting" && t.tunnelStarting}
+                {tunnelStatus === "active" && t.tunnelActiveDesc}
+                {tunnelStatus === "error" && t.tunnelError}
               </div>
             </div>
           </div>
           <div style={s.tunnelActions}>
             {tunnelStatus === "active" && (
               <button onClick={() => setShowRemoteAccess(true)} style={s.tunnelViewBtn}>
-                📡 Voir le QR distant
+                {t.tunnelViewQr}
               </button>
             )}
             {(tunnelStatus === "error" || tunnelStatus === "inactive") && (
               <button onClick={restartTunnel} style={s.tunnelRestartBtn}>
-                🔄 {tunnelStatus === "error" ? "Relancer" : "Activer"}
+                🔄 {tunnelStatus === "error" ? t.tunnelRetry : t.tunnelEnable}
               </button>
             )}
             {tunnelStatus === "active" && (
@@ -539,9 +548,9 @@ export default function App() {
         <div style={s.tunnelTeaser} onClick={() => setShowProModal(true)}>
           <span style={{ fontSize: 16 }}>🌐</span>
           <span style={{ fontSize: 12, color: "#60a5fa", flex: 1 }}>
-            Mode Relay cloud — Accède à ton PC depuis n'importe où, même hors Wi-Fi
+            {t.tunnelTeaser}
           </span>
-          <span style={s.tunnelTeaserLock}>⚡ Pro</span>
+          <span style={s.tunnelTeaserLock}>{t.proTag}</span>
         </div>
       )}
 
@@ -591,8 +600,8 @@ export default function App() {
             <div style={s.proFeatureTeaser} onClick={() => setShowProModal(true)}>
               <div style={s.teaserIcon}>📤</div>
               <div>
-                <div style={s.teaserTitle}>Envoyer vers le téléphone</div>
-                <div style={s.teaserSub}>Disponible avec le plan Pro</div>
+                <div style={s.teaserTitle}>{t.teaserSendTitle}</div>
+                <div style={s.teaserSub}>{t.availablePro}</div>
               </div>
               <div style={s.teaserLock}>🔒</div>
             </div>
@@ -607,7 +616,7 @@ export default function App() {
               {t.historyTitle}
               {files.length > 0 && <span style={s.count}>{files.length}</span>}
               {isFree && files.length > 0 && (
-                <span style={s.historyLimitBadge}>7 jours</span>
+                <span style={s.historyLimitBadge}>{t.historyDays}</span>
               )}
             </h2>
             {files.length > 0 && (
@@ -673,7 +682,7 @@ export default function App() {
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={s.fileName}>{file.name}</div>
                       <div style={s.fileMeta}>
-                        {formatSize(file.size)}
+                        {formatSize(file.size, t.sizeUnits)}
                         {file.date && <span> · {file.date}</span>}
                         {file.time && <span> · {file.time}</span>}
                       </div>
@@ -704,7 +713,7 @@ export default function App() {
             <div style={s.historyUpsell} onClick={() => setShowProModal(true)}>
               <span style={{ fontSize: 14 }}>⚡</span>
               <span style={{ fontSize: 12, color: "#60a5fa" }}>
-                Pro : historique illimité, pas de limite de temps
+                {t.historyUpsell}
               </span>
               <span style={{ fontSize: 12, color: "#3b82f6", fontWeight: 600 }}>→</span>
             </div>
@@ -720,7 +729,7 @@ export default function App() {
             { icon: "📦", num: files.length, label: t.statsTotal, color: "#3b82f6" },
             { icon: "🖼️", num: stats.images, label: t.statsPhotos, color: "#22c55e" },
             { icon: "🎬", num: stats.videos, label: t.statsVideos, color: "#a78bfa" },
-            { icon: "💾", num: formatSize(totalSize), label: t.statsVolume, color: "#f59e0b" },
+            { icon: "💾", num: formatSize(totalSize, t.sizeUnits), label: t.statsVolume, color: "#f59e0b" },
           ].map((item, i) => (
             <div key={i} style={s.bottomStatCard}>
               <div style={{ ...s.bottomStatIcon, background: `${item.color}22`, color: item.color }}>
@@ -741,6 +750,7 @@ export default function App() {
       )}
       {showProModal && (
         <ProActivation
+          t={t}
           onActivated={async () => {
             await invoke("check_license");
             const info = await invoke("get_plan_info");
@@ -754,8 +764,8 @@ export default function App() {
           <div style={s.remoteModal}>
             <div style={s.remoteHeader}>
               <div>
-                <h2 style={s.remoteTitle}>🌐 Accès distant</h2>
-                <p style={s.remoteSub}>Scanne ce QR depuis n'importe quel réseau (4G, autre Wi-Fi...)</p>
+                <h2 style={s.remoteTitle}>{t.remoteTitle}</h2>
+                <p style={s.remoteSub}>{t.remoteSub}</p>
               </div>
               <button onClick={() => setShowRemoteAccess(false)} style={s.remoteCloseBtn}>✕</button>
             </div>
@@ -765,19 +775,19 @@ export default function App() {
                   <img src={tunnelQrCode} alt="QR distant" style={s.remoteQr} />
                   <p style={s.remoteUrl}>{tunnelUrl}</p>
                   <div style={s.remoteWarning}>
-                    ⚠️ Cette URL transite par Cloudflare. Le PIN reste requis pour la sécurité.
+                    {t.remoteWarning}
                   </div>
                 </>
               ) : (
                 <div style={{ textAlign: "center", color: "#64748b", padding: 40 }}>
-                  ⏳ Génération du QR code...
+                  {t.remoteGenerating}
                 </div>
               )}
             </div>
           </div>
         </div>
       )}
-      <Updater />
+      <Updater t={t} />
 
     </div>
   );

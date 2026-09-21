@@ -86,18 +86,18 @@
 <body>
   <div class="logo">📁</div>
   <h1>TransferBridge</h1>
-  <p class="subtitle">Transfert sécurisé · v1.2.0</p>
+  <p class="subtitle" data-i18n="subtitle">Transfert sécurisé · v1.2.0</p>
 
   <!-- PIN Screen -->
   <div id="pin-screen">
-    <p class="pin-label">🔐 Saisis le code PIN affiché sur le PC</p>
+    <p class="pin-label" data-i18n="pinLabel">🔐 Saisis le code PIN affiché sur le PC</p>
     <div class="pin-inputs">
       <input class="pin-digit" id="p0" type="tel" maxlength="1" inputmode="numeric" autocomplete="one-time-code">
       <input class="pin-digit" id="p1" type="tel" maxlength="1" inputmode="numeric" autocomplete="off">
       <input class="pin-digit" id="p2" type="tel" maxlength="1" inputmode="numeric" autocomplete="off">
       <input class="pin-digit" id="p3" type="tel" maxlength="1" inputmode="numeric" autocomplete="off">
     </div>
-    <button class="pin-btn" id="pinBtn" onclick="submitPin()">Valider</button>
+    <button class="pin-btn" id="pinBtn" onclick="submitPin()" data-i18n="validate">Valider</button>
     <div class="pin-error" id="pinError">❌ PIN incorrect. Demande un nouveau PIN sur le PC.</div>
   </div>
 
@@ -107,7 +107,7 @@
 
     <!-- Compteur journalier (gratuit seulement) -->
     <div class="daily-counter" id="dailyCounter" style="display:none">
-      <div class="counter-text">Envois aujourd'hui</div>
+      <div class="counter-text" data-i18n="todaySends">Envois aujourd'hui</div>
       <div class="counter-bar-wrap">
         <div class="counter-bar" id="counterBar"></div>
       </div>
@@ -116,15 +116,15 @@
 
     <!-- Bannière Pro quand limite atteinte -->
     <div class="pro-banner" id="proBanner" style="display:none">
-      <div class="pro-banner-title">🚀 Limite journalière atteinte</div>
-      <div class="pro-banner-sub">Passez à Pro pour des envois illimités, taille illimitée et bien plus.</div>
-      <a href="https://transferbridge.site/checkout.html" target="_blank" class="pro-banner-btn">⚡ Passer à Pro — 19.99€/mois</a>
+      <div class="pro-banner-title" data-i18n="bannerTitle">🚀 Limite journalière atteinte</div>
+      <div class="pro-banner-sub" data-i18n="bannerSub">Passez à Pro pour des envois illimités, taille illimitée et bien plus.</div>
+      <a href="https://transferbridge.site/checkout.html" target="_blank" class="pro-banner-btn" data-i18n="bannerBtn">⚡ Passer à Pro — 19.99€/mois</a>
     </div>
 
     <!-- Onglets (Pro seulement) -->
     <div class="tabs" id="tabs" style="display:none">
-      <button class="tab-btn active" id="tab-receive" onclick="switchTab('receive')">📥 Recevoir</button>
-      <button class="tab-btn inactive" id="tab-download" onclick="switchTab('download')">📤 Du PC</button>
+      <button class="tab-btn active" id="tab-receive" onclick="switchTab('receive')" data-i18n="tabReceive">📥 Recevoir</button>
+      <button class="tab-btn inactive" id="tab-download" onclick="switchTab('download')" data-i18n="tabDownload">📤 Du PC</button>
     </div>
 
     <!-- Panel Recevoir -->
@@ -132,28 +132,132 @@
       <div class="drop-zone" id="dropZone">
         <input type="file" id="fileInput" multiple accept="*/*">
         <div class="drop-icon">📂</div>
-        <div class="drop-text"><span>Appuie ici</span> pour sélectionner<br>photos, vidéos, PDF, tout type</div>
+        <div class="drop-text" data-i18n-html="dropText"><span>Appuie ici</span> pour sélectionner<br>photos, vidéos, PDF, tout type</div>
       </div>
       <div class="file-list" id="fileList"></div>
-      <button class="send-btn" id="sendBtn" style="display:none">🚀 Envoyer sur le PC</button>
+      <button class="send-btn" id="sendBtn" style="display:none" data-i18n="sendBtn">🚀 Envoyer sur le PC</button>
       <div class="result" id="result"></div>
     </div>
 
     <!-- Panel Télécharger (Pro) -->
     <div id="panel-download" style="display:none">
-      <div id="dl-empty" class="empty-state">
-        <div style="font-size:40px;margin-bottom:12px">📭</div>
-        <p>Aucun fichier en attente</p>
-        <p style="font-size:12px;margin-top:4px;color:#475569">Envoie des fichiers depuis l'app PC</p>
-      </div>
+      <div id="dl-empty" class="empty-state"></div>
       <div id="dl-list"></div>
-      <button class="refresh-btn" onclick="refreshDownloads()">🔄 Actualiser</button>
+      <button class="refresh-btn" onclick="refreshDownloads()" data-i18n="refresh">🔄 Actualiser</button>
     </div>
   </div>
 
   <script>
+    // ── Traductions (langue détectée depuis le navigateur du téléphone) ──
+    const I18N = {
+      fr: {
+        subtitle: 'Transfert sécurisé · v1.2.0',
+        pinLabel: '🔐 Saisis le code PIN affiché sur le PC',
+        validate: 'Valider', verifying: '⏳ Vérification...',
+        pinWrong: '❌ PIN incorrect. Demande un nouveau PIN sur le PC.',
+        tooMany: '⏳ Trop de tentatives. Réessaie dans {n}s.',
+        sessionExpired: '⚠️ Session expirée. Saisis le nouveau PIN.',
+        connectedFree: '✅ Connecté — Plan Gratuit', connectedPro: '⚡ {plan} — Connecté',
+        plan_free: 'Gratuit', plan_monthly: 'Pro Mensuel', plan_annual: 'Pro Annuel', plan_team: 'Team',
+        todaySends: "Envois aujourd'hui",
+        bannerTitle: '🚀 Limite journalière atteinte',
+        bannerSub: 'Passez à Pro pour des envois illimités, taille illimitée et bien plus.',
+        bannerBtn: '⚡ Passer à Pro — 19.99€/mois',
+        tabReceive: '📥 Recevoir', tabDownload: '📤 Du PC',
+        dropText: '<span>Appuie ici</span> pour sélectionner<br>photos, vidéos, PDF, tout type',
+        sendBtn: '🚀 Envoyer sur le PC',
+        dlNone: 'Aucun fichier en attente', dlNoneHint: "Envoie des fichiers depuis l'app PC",
+        refresh: '🔄 Actualiser',
+        proFeature: 'Fonctionnalité Pro',
+        proFeatureSub: 'Le transfert PC → Téléphone est réservé aux abonnés Pro.',
+        getPro: '⚡ Passer à Pro',
+        waiting: 'En attente', sending: 'Envoi...', finalizing: 'Finalisation...', sent: 'Envoyé !',
+        tooBig: '❌ Trop lourd', sendingBtn: '⏳ Envoi en cours...',
+        allSent: '✅ Tous les fichiers ont été envoyés !', someFailed: '❌ Certains fichiers ont échoué.',
+        retry: '🔄 Réessayer',
+        limitMsg: '⏳ Limite de 10 envois/jour atteinte. Revenez demain ou passez à Pro !',
+        units: ['o', 'Ko', 'Mo'],
+      },
+      en: {
+        subtitle: 'Secure transfer · v1.2.0',
+        pinLabel: '🔐 Enter the PIN code shown on the PC',
+        validate: 'Confirm', verifying: '⏳ Verifying...',
+        pinWrong: '❌ Wrong PIN. Ask for a new PIN on the PC.',
+        tooMany: '⏳ Too many attempts. Try again in {n}s.',
+        sessionExpired: '⚠️ Session expired. Enter the new PIN.',
+        connectedFree: '✅ Connected — Free Plan', connectedPro: '⚡ {plan} — Connected',
+        plan_free: 'Free', plan_monthly: 'Pro Monthly', plan_annual: 'Pro Annual', plan_team: 'Team',
+        todaySends: 'Transfers today',
+        bannerTitle: '🚀 Daily limit reached',
+        bannerSub: 'Go Pro for unlimited transfers, unlimited file size and more.',
+        bannerBtn: '⚡ Go Pro — €19.99/month',
+        tabReceive: '📥 Receive', tabDownload: '📤 From PC',
+        dropText: '<span>Tap here</span> to select<br>photos, videos, PDFs, any file',
+        sendBtn: '🚀 Send to PC',
+        dlNone: 'No files waiting', dlNoneHint: 'Send files from the PC app',
+        refresh: '🔄 Refresh',
+        proFeature: 'Pro feature',
+        proFeatureSub: 'PC → Phone transfer is reserved for Pro subscribers.',
+        getPro: '⚡ Go Pro',
+        waiting: 'Waiting', sending: 'Sending...', finalizing: 'Finalizing...', sent: 'Sent!',
+        tooBig: '❌ Too large', sendingBtn: '⏳ Sending...',
+        allSent: '✅ All files were sent!', someFailed: '❌ Some files failed.',
+        retry: '🔄 Retry',
+        limitMsg: '⏳ Limit of 10 transfers/day reached. Come back tomorrow or go Pro!',
+        units: ['B', 'KB', 'MB'],
+      },
+      es: {
+        subtitle: 'Transferencia segura · v1.2.0',
+        pinLabel: '🔐 Introduce el código PIN que aparece en el PC',
+        validate: 'Validar', verifying: '⏳ Verificando...',
+        pinWrong: '❌ PIN incorrecto. Pide un nuevo PIN en el PC.',
+        tooMany: '⏳ Demasiados intentos. Inténtalo de nuevo en {n}s.',
+        sessionExpired: '⚠️ Sesión expirada. Introduce el nuevo PIN.',
+        connectedFree: '✅ Conectado — Plan Gratis', connectedPro: '⚡ {plan} — Conectado',
+        plan_free: 'Gratis', plan_monthly: 'Pro Mensual', plan_annual: 'Pro Anual', plan_team: 'Team',
+        todaySends: 'Envíos hoy',
+        bannerTitle: '🚀 Límite diario alcanzado',
+        bannerSub: 'Hazte Pro para envíos ilimitados, tamaño ilimitado y mucho más.',
+        bannerBtn: '⚡ Hazte Pro — 19,99 €/mes',
+        tabReceive: '📥 Recibir', tabDownload: '📤 Del PC',
+        dropText: '<span>Toca aquí</span> para seleccionar<br>fotos, vídeos, PDF, cualquier archivo',
+        sendBtn: '🚀 Enviar al PC',
+        dlNone: 'Ningún archivo en espera', dlNoneHint: 'Envía archivos desde la app del PC',
+        refresh: '🔄 Actualizar',
+        proFeature: 'Función Pro',
+        proFeatureSub: 'La transferencia PC → Teléfono está reservada a los suscriptores Pro.',
+        getPro: '⚡ Hazte Pro',
+        waiting: 'En espera', sending: 'Enviando...', finalizing: 'Finalizando...', sent: '¡Enviado!',
+        tooBig: '❌ Demasiado pesado', sendingBtn: '⏳ Enviando...',
+        allSent: '✅ ¡Todos los archivos se han enviado!', someFailed: '❌ Algunos archivos han fallado.',
+        retry: '🔄 Reintentar',
+        limitMsg: '⏳ Límite de 10 envíos/día alcanzado. Vuelve mañana o hazte Pro.',
+        units: ['B', 'KB', 'MB'],
+      },
+    };
+    const LANG = (() => {
+      const l = (navigator.language || 'fr').toLowerCase();
+      return l.startsWith('es') ? 'es' : l.startsWith('en') ? 'en' : 'fr';
+    })();
+    const T = I18N[LANG];
+    function tr(key, vars) {
+      let s = T[key] ?? I18N.fr[key] ?? key;
+      if (vars) for (const k in vars) s = s.split('{' + k + '}').join(vars[k]);
+      return s;
+    }
+    function applyI18n() {
+      document.documentElement.lang = LANG;
+      document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = tr(el.dataset.i18n); });
+      document.querySelectorAll('[data-i18n-html]').forEach(el => { el.innerHTML = tr(el.dataset.i18nHtml); });
+    }
+    function emptyDownloadsHTML() {
+      return '<div style="font-size:40px;margin-bottom:12px">📭</div><p>' + tr('dlNone') + '</p><p style="font-size:12px;margin-top:4px;color:#475569">' + tr('dlNoneHint') + '</p>';
+    }
+
     let sessionToken = null, selectedFiles = [], ws = null;
-    let planInfo = { plan: 'Gratuit', bidirectional: false, uploads_left: 10, uploads_limit: 10 };
+    let planInfo = { plan: 'Gratuit', plan_id: 'free', bidirectional: false, uploads_left: 10, uploads_limit: 10 };
+    applyI18n();
+    document.getElementById('dl-empty').innerHTML = emptyDownloadsHTML();
 
     // Échappe le HTML : les noms de fichiers sont contrôlés par un tiers
     function esc(s) {
@@ -173,7 +277,7 @@
           }
           if (data.type === 'file-queued') {
             const tab = document.getElementById('tab-download');
-            if (tab) tab.textContent = '📤 Du PC 🔴';
+            if (tab) tab.textContent = tr('tabDownload') + ' 🔴';
             const panel = document.getElementById('panel-download');
             if (panel && panel.style.display !== 'none') refreshDownloads();
           }
@@ -189,12 +293,12 @@
     }
 
     function updatePlanUI() {
-      const isPro = planInfo.plan !== 'Gratuit';
+      const isPro = planInfo.plan_id !== 'free';
       const badge = document.getElementById('connectedBadge');
       if (badge) {
         badge.textContent = isPro
-          ? '⚡ ' + planInfo.plan + ' — Connecté'
-          : '✅ Connecté — Plan Gratuit';
+          ? tr('connectedPro', { plan: tr('plan_' + planInfo.plan_id) })
+          : tr('connectedFree');
       }
 
       // Onglets bidirectionnels : Pro seulement
@@ -263,7 +367,7 @@
     async function submitPin() {
       const pin = digits.map(d => d.value.replace(/\D/g,'')).join('');
       if (pin.length !== 4) return;
-      pinBtn.disabled = true; pinBtn.textContent = '⏳ Vérification...';
+      pinBtn.disabled = true; pinBtn.textContent = tr('verifying');
       pinError.style.display = 'none';
       try {
         const res  = await fetch('/verify-pin', {
@@ -272,10 +376,10 @@
         const data = await res.json();
         if (res.status === 429 || data.error === 'locked') {
           const wait = data.retry_after ? Math.ceil(data.retry_after) : 30;
-          pinError.textContent = `⏳ Trop de tentatives. Réessaie dans ${wait}s.`;
+          pinError.textContent = tr('tooMany', { n: wait });
           pinError.style.display = 'block';
           digits.forEach(d => { d.value = ''; d.classList.remove('filled'); });
-          pinBtn.disabled = false; pinBtn.textContent = 'Valider'; pinBtn.className = 'pin-btn';
+          pinBtn.disabled = false; pinBtn.textContent = tr('validate'); pinBtn.className = 'pin-btn';
           return;
         }
         if (data.success) {
@@ -283,6 +387,7 @@
           // Récupère les infos du plan depuis la réponse
           planInfo = {
             plan:          data.plan || 'Gratuit',
+            plan_id:       data.plan_id || 'free',
             bidirectional: data.bidirectional || false,
             uploads_left:  data.uploads_left,
             uploads_limit: data.uploads_limit,
@@ -294,9 +399,9 @@
       } catch {
         digits.forEach(d => { d.classList.add('error'); d.value = ''; d.classList.remove('filled'); });
         setTimeout(() => digits.forEach(d => d.classList.remove('error')), 500);
-        pinError.textContent = '❌ PIN incorrect. Demande un nouveau PIN sur le PC.';
+        pinError.textContent = tr('pinWrong');
         pinError.style.display = 'block';
-        pinBtn.disabled = false; pinBtn.textContent = 'Valider'; pinBtn.className = 'pin-btn';
+        pinBtn.disabled = false; pinBtn.textContent = tr('validate'); pinBtn.className = 'pin-btn';
         digits[0].focus();
       }
     }
@@ -321,9 +426,9 @@
           document.getElementById('dl-list').innerHTML = '';
           document.getElementById('dl-empty').innerHTML = `
             <div style="font-size:40px;margin-bottom:12px">⚡</div>
-            <p style="font-weight:700;color:#f1f5f9">Fonctionnalité Pro</p>
-            <p style="font-size:12px;margin-top:4px">Le transfert PC → Téléphone est réservé aux abonnés Pro.</p>
-            <a href="https://transferbridge.site/checkout.html" target="_blank" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#3b82f6;color:white;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none">⚡ Passer à Pro</a>
+            <p style="font-weight:700;color:#f1f5f9">${tr('proFeature')}</p>
+            <p style="font-size:12px;margin-top:4px">${tr('proFeatureSub')}</p>
+            <a href="https://transferbridge.site/checkout.html" target="_blank" style="display:inline-block;margin-top:12px;padding:8px 16px;background:#3b82f6;color:white;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none">${tr('getPro')}</a>
           `;
           document.getElementById('dl-empty').style.display = 'block';
           return;
@@ -336,7 +441,7 @@
       const empty = document.getElementById('dl-empty');
       const list  = document.getElementById('dl-list');
       if (!files || !files.length) {
-        empty.innerHTML = `<div style="font-size:40px;margin-bottom:12px">📭</div><p>Aucun fichier en attente</p><p style="font-size:12px;margin-top:4px;color:#475569">Envoie des fichiers depuis l'app PC</p>`;
+        empty.innerHTML = emptyDownloadsHTML();
         empty.style.display='block'; list.innerHTML=''; return;
       }
       empty.style.display = 'none';
@@ -378,8 +483,9 @@
       if (['mp3','wav','aac'].includes(e)) return '🎵'; return '📎';
     }
     function fmtSize(b) {
-      if (b<1024) return b+' o'; if (b<1048576) return (b/1024).toFixed(1)+' Ko';
-      return (b/1048576).toFixed(1)+' Mo';
+      const u = T.units;
+      if (b<1024) return b+' '+u[0]; if (b<1048576) return (b/1024).toFixed(1)+' '+u[1];
+      return (b/1048576).toFixed(1)+' '+u[2];
     }
     function addFiles(files) {
       // Vérifie la limite
@@ -399,7 +505,7 @@
             <div class="file-name">${esc(f.name)}</div>
             <div class="file-size-t">${fmtSize(f.size)}</div>
             <div class="progress-bar"><div class="progress-fill" id="pf-${i}"></div></div>
-            <div class="progress-label"><span id="pl-${i}">En attente</span><span id="pp-${i}">0%</span></div>
+            <div class="progress-label"><span id="pl-${i}">${tr('waiting')}</span><span id="pp-${i}">0%</span></div>
           </div>
           <div class="file-status" id="st-${i}">⏳</div>
         </div>`).join('');
@@ -413,14 +519,14 @@
           if (!e.lengthComputable) return;
           const pct = Math.round((e.loaded/e.total)*100);
           const fill=document.getElementById('pf-'+index), label=document.getElementById('pl-'+index), pctEl=document.getElementById('pp-'+index);
-          if(fill) fill.style.width=pct+'%'; if(label) label.textContent=pct<100?'Envoi...':'Finalisation...'; if(pctEl) pctEl.textContent=pct+'%';
+          if(fill) fill.style.width=pct+'%'; if(label) label.textContent=pct<100?tr('sending'):tr('finalizing'); if(pctEl) pctEl.textContent=pct+'%';
           sendProgress(file.name, pct);
         });
         xhr.addEventListener('load', () => {
           if (xhr.status>=200 && xhr.status<300) {
             const fill=document.getElementById('pf-'+index), label=document.getElementById('pl-'+index);
             const pctEl=document.getElementById('pp-'+index), status=document.getElementById('st-'+index);
-            if(fill){fill.style.width='100%';fill.classList.add('done');} if(label) label.textContent='Envoyé !';
+            if(fill){fill.style.width='100%';fill.classList.add('done');} if(label) label.textContent=tr('sent');
             if(pctEl) pctEl.textContent='100%'; if(status) status.textContent='✅';
             // Met à jour le compteur
             if (planInfo.uploads_left !== null && planInfo.uploads_left !== undefined) {
@@ -432,18 +538,18 @@
             // Limite journalière
             result.style.display='block';
             result.className='result limit';
-            result.textContent='⏳ Limite de 10 envois/jour atteinte. Revenez demain ou passez à Pro !';
+            result.textContent=tr('limitMsg');
             if (planInfo.uploads_left !== null) planInfo.uploads_left = 0;
             updatePlanUI();
             reject(new Error('Limite atteinte'));
           } else if (xhr.status===413) {
             const fill=document.getElementById('pf-'+index), label=document.getElementById('pl-'+index), status=document.getElementById('st-'+index);
-            if(fill) fill.classList.add('error'); if(label) label.textContent='❌ Trop lourd'; if(status) status.textContent='❌';
+            if(fill) fill.classList.add('error'); if(label) label.textContent=tr('tooBig'); if(status) status.textContent='❌';
             reject(new Error('Trop lourd'));
           } else if (xhr.status===401) {
             document.getElementById('upload-screen').style.display='none';
             document.getElementById('pin-screen').style.display='block';
-            pinError.textContent='⚠️ Session expirée. Saisis le nouveau PIN.'; pinError.style.display='block';
+            pinError.textContent=tr('sessionExpired'); pinError.style.display='block';
             reject(new Error('Session expirée'));
           } else reject(new Error('Erreur serveur'));
         });
@@ -456,17 +562,17 @@
     }
 
     sendBtn.addEventListener('click', async () => {
-      sendBtn.disabled=true; sendBtn.textContent='⏳ Envoi en cours...';
+      sendBtn.disabled=true; sendBtn.textContent=tr('sendingBtn');
       let allOk=true;
       for (let i=0; i<selectedFiles.length; i++) { try { await uploadFile(selectedFiles[i],i); } catch { allOk=false; } }
       result.style.display='block';
       if (allOk) {
-        result.className='result ok'; result.textContent='✅ Tous les fichiers ont été envoyés !';
+        result.className='result ok'; result.textContent=tr('allSent');
         selectedFiles=[];
-        setTimeout(()=>{ render(); sendBtn.style.display='none'; sendBtn.disabled=false; sendBtn.textContent='🚀 Envoyer sur le PC'; }, 2000);
+        setTimeout(()=>{ render(); sendBtn.style.display='none'; sendBtn.disabled=false; sendBtn.textContent=tr('sendBtn'); }, 2000);
       } else if (result.className !== 'result limit') {
-        result.className='result err'; result.textContent="❌ Certains fichiers ont échoué.";
-        sendBtn.disabled=false; sendBtn.textContent='🔄 Réessayer';
+        result.className='result err'; result.textContent=tr('someFailed');
+        sendBtn.disabled=false; sendBtn.textContent=tr('retry');
       }
     });
   </script>

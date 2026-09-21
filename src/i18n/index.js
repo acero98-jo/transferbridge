@@ -21,3 +21,8 @@ export function detectLanguage() {
 export function getT(lang) {
   return languages[lang] || languages.fr;
 }
+
+// Remplace les {variables} d'une chaîne : fmt("{a} sur {b}", { a: 1, b: 2 })
+export function fmt(template, vars = {}) {
+  return String(template).replace(/\{(\w+)\}/g, (m, k) => (k in vars ? vars[k] : m));
+}

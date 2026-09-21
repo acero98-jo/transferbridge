@@ -31,7 +31,7 @@ export default function SendToPhone({ t }) {
     try {
       const selected = await open({
         multiple: true,
-        title: "Choisir les fichiers à envoyer au téléphone",
+        title: t.stpDialogTitle,
       });
       if (!selected) return;
 
@@ -58,25 +58,25 @@ export default function SendToPhone({ t }) {
     <div style={s.container}>
       <div style={s.header}>
         <div>
-          <h3 style={s.title}>📤 Envoyer vers le téléphone</h3>
+          <h3 style={s.title}>{t.stpTitle}</h3>
           <p style={s.sub}>
-            Sélectionne des fichiers — ils apparaîtront sur l'interface mobile
+            {t.stpSub}
           </p>
         </div>
         <button onClick={pickFile} disabled={loading} style={s.addBtn}>
-          {loading ? "⏳..." : "+ Ajouter"}
+          {loading ? "⏳..." : t.stpAdd}
         </button>
       </div>
 
       {pendingFiles.length === 0 ? (
         <div style={s.empty}>
           <div style={{ fontSize: 36, marginBottom: 10 }}>📂</div>
-          <p>Aucun fichier en attente</p>
+          <p>{t.stpNone}</p>
           <p style={{ fontSize: 12, color: "#475569", marginTop: 4 }}>
-            Les fichiers expirent après 10 minutes
+            {t.stpExpire}
           </p>
           <button onClick={pickFile} style={s.emptyBtn}>
-            + Choisir un fichier
+            {t.stpPick}
           </button>
         </div>
       ) : (
@@ -86,13 +86,13 @@ export default function SendToPhone({ t }) {
               <span style={{ fontSize: 22 }}>{getFileIcon(file.name)}</span>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={s.fileName}>{file.name}</div>
-                <div style={s.fileMeta}>{formatSize(file.size)}</div>
+                <div style={s.fileMeta}>{formatSize(file.size, t.sizeUnits)}</div>
               </div>
-              <span style={s.waitBadge}>⏳ En attente</span>
+              <span style={s.waitBadge}>{t.stpWaiting}</span>
               <button
                 onClick={() => cancelFile(file.id)}
                 style={s.cancelBtn}
-                title="Annuler"
+                title={t.stpCancel}
               >
                 ✕
               </button>
@@ -103,7 +103,7 @@ export default function SendToPhone({ t }) {
 
       {pendingFiles.length > 0 && (
         <p style={s.hint}>
-          📱 Le téléphone voit ces fichiers dans l'onglet "Télécharger"
+          {t.stpHint}
         </p>
       )}
     </div>

@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
 
-export default function Updater() {
+export default function Updater({ t }) {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [downloading, setDownloading]         = useState(false);
   const [progress, setProgress]               = useState(0);
@@ -54,16 +54,16 @@ export default function Updater() {
           <div style={s.info}>
             <span style={s.icon}>🆕</span>
             <div>
-              <div style={s.title}>Mise à jour disponible !</div>
-              <div style={s.sub}>Une nouvelle version de TransferBridge est prête.</div>
+              <div style={s.title}>{t.updAvailable}</div>
+              <div style={s.sub}>{t.updReady}</div>
             </div>
           </div>
           <div style={s.actions}>
             <button onClick={() => setUpdateAvailable(false)} style={s.skipBtn}>
-              Plus tard
+              {t.updLater}
             </button>
             <button onClick={handleUpdate} style={s.updateBtn}>
-              ⬇️ Mettre à jour
+              {t.updNow}
             </button>
           </div>
         </>
@@ -72,7 +72,7 @@ export default function Updater() {
       {downloading && !done && (
         <div style={s.progress}>
           <div style={s.progressLabel}>
-            <span>⏳ Téléchargement en cours...</span>
+            <span>{t.updDownloading}</span>
             <span>{progress}%</span>
           </div>
           <div style={s.progressBar}>
@@ -85,11 +85,11 @@ export default function Updater() {
         <div style={s.info}>
           <span style={s.icon}>✅</span>
           <div>
-            <div style={s.title}>Mise à jour installée !</div>
-            <div style={s.sub}>Relance l'app pour appliquer les changements.</div>
+            <div style={s.title}>{t.updInstalled}</div>
+            <div style={s.sub}>{t.updRelaunchHint}</div>
           </div>
           <button onClick={handleRelaunch} style={s.updateBtn}>
-            🔄 Relancer
+            {t.updRelaunch}
           </button>
         </div>
       )}

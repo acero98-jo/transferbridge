@@ -3,11 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 
 const CATEGORIES = [
-  { key: "bug",         label: "🐛 Bug",         desc: "Quelque chose ne fonctionne pas" },
-  { key: "feature",     label: "💡 Idée",         desc: "Suggérer une fonctionnalité" },
-  { key: "performance", label: "⚡ Performance",   desc: "Lenteur, crash, mémoire" },
-  { key: "ux",          label: "🎨 UX/Design",     desc: "Interface, ergonomie" },
-  { key: "general",     label: "💬 Général",       desc: "Autre chose" },
+  { key: "bug",         labelKey: "catBug" },
+  { key: "feature",     labelKey: "catFeature" },
+  { key: "performance", labelKey: "catPerf" },
+  { key: "ux",          labelKey: "catUx" },
+  { key: "general",     labelKey: "catGeneral" },
 ];
 
 export default function Feedback({ onClose, t }) {
@@ -21,7 +21,7 @@ export default function Feedback({ onClose, t }) {
   const [error, setError]       = useState(null);
 
   async function submit() {
-    if (!message.trim()) { setError("Merci d'écrire un message."); return; }
+    if (!message.trim()) { setError(t.fbErrEmpty); return; }
     setLoading(true); setError(null);
     try {
       const appVersion = await getVersion().catch(() => "unknown");
@@ -37,7 +37,7 @@ export default function Feedback({ onClose, t }) {
       });
       setStep(3);
     } catch (e) {
-      setError("Erreur d'envoi. Vérifie ta connexion internet.");
+      setError(t.fbErrSend);
     } finally {
       setLoading(false);
     }
@@ -50,8 +50,8 @@ export default function Feedback({ onClose, t }) {
         {/* Header */}
         <div style={s.header}>
           <div>
-            <h2 style={s.title}>💬 Ton avis nous aide</h2>
-            <p style={s.subtitle}>Anonyme · 2 minutes max</p>
+            <h2 style={s.title}>{t.fbTitle}</h2>
+            <p style={s.subtitle}>{t.fbSub}</p>
           </div>
           <button onClick={onClose} style={s.closeBtn}>✕</button>
         </div>
@@ -59,7 +59,7 @@ export default function Feedback({ onClose, t }) {
         {/* Step 1 — Note */}
         {step === 1 && (
           <div style={s.body}>
-            <p style={s.question}>Comment tu trouves TransferBridge ?</p>
+            <p style={s.question}>{t.fbQuestion}</p>
             <div style={s.stars}>
               {[1,2,3,4,5].map(n => (
                 <button
@@ -78,11 +78,11 @@ export default function Feedback({ onClose, t }) {
               ))}
             </div>
             <div style={s.ratingLabels}>
-              <span>Décevant</span>
-              <span>Excellent !</span>
+              <span>{t.fbBad}</span>
+              <span>{t.fbGreat}</span>
             </div>
             <p style={{ fontSize: 12, color: "#475569", textAlign: "center", marginTop: 16 }}>
-              Clique sur une étoile pour continuer
+              {t.fbClickStar}
             </p>
           </div>
         )}
@@ -105,7 +105,7 @@ export default function Feedback({ onClose, t }) {
             </div>
 
             {/* Catégorie */}
-            <p style={s.label}>Quel type de feedback ?</p>
+            <p style={s.label}>{t.fbTypeQ}</p>
             <div style={s.categories}>
               {CATEGORIES.map(c => (
                 <button
@@ -118,18 +118,18 @@ export default function Feedback({ onClose, t }) {
                     color: category === c.key ? "#60a5fa" : "#94a3b8",
                   }}
                 >
-                  <span style={{ fontSize: 15 }}>{c.label.split(" ")[0]}</span>
-                  <span style={{ fontSize: 12 }}>{c.label.split(" ").slice(1).join(" ")}</span>
+                  <span style={{ fontSize: 15 }}>{t[c.labelKey].split(" ")[0]}</span>
+                  <span style={{ fontSize: 12 }}>{t[c.labelKey].split(" ").slice(1).join(" ")}</span>
                 </button>
               ))}
             </div>
 
             {/* Message */}
-            <p style={s.label}>Ton message <span style={{ color: "#ef4444" }}>*</span></p>
+            <p style={s.label}>{t.fbMsgLabel} <span style={{ color: "#ef4444" }}>*</span></p>
             <textarea
               value={message}
               onChange={e => setMessage(e.target.value)}
-              placeholder="Décris ton expérience, ce qui fonctionne, ce qui manque..."
+              placeholder={t.fbMsgPlaceholder}
               maxLength={1000}
               style={s.textarea}
             />
@@ -138,7 +138,7 @@ export default function Feedback({ onClose, t }) {
             </div>
 
             {/* Email optionnel */}
-            <p style={s.label}>Email (optionnel — pour qu'on te réponde)</p>
+            <p style={s.label}>{t.fbEmailLabel}</p>
             <input
               type="email"
               value={email}
@@ -150,7 +150,7 @@ export default function Feedback({ onClose, t }) {
             {error && <div style={s.error}>{error}</div>}
 
             <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
-              <button onClick={() => setStep(1)} style={s.backBtn}>← Retour</button>
+              <button onClick={() => setStep(1)} style={s.backBtn}>{t.fbBack}</button>
               <button
                 onClick={submit}
                 disabled={loading || !message.trim()}
@@ -160,7 +160,7 @@ export default function Feedback({ onClose, t }) {
                   cursor: loading || !message.trim() ? "not-allowed" : "pointer",
                 }}
               >
-                {loading ? "⏳ Envoi..." : "🚀 Envoyer le feedback"}
+                {loading ? t.fbSending : t.fbSend}
               </button>
             </div>
           </div>
@@ -171,11 +171,11 @@ export default function Feedback({ onClose, t }) {
           <div style={{ ...s.body, textAlign: "center", padding: "40px 24px" }}>
             <div style={{ fontSize: 64, marginBottom: 20 }}>🙏</div>
             <h3 style={{ fontFamily: "inherit", fontSize: 20, fontWeight: 700, marginBottom: 12 }}>
-              Merci pour ton feedback !
+              {t.fbThanks}
             </h3>
             <p style={{ color: "#94a3b8", fontSize: 14, marginBottom: 32, lineHeight: 1.6 }}>
-              Ton avis nous aide directement à améliorer TransferBridge.<br/>
-              On lit chaque message personnellement.
+              {t.fbThanksSub1}<br/>
+              {t.fbThanksSub2}
             </p>
             <div style={s.stars}>
               {[1,2,3,4,5].map(n => (
@@ -183,7 +183,7 @@ export default function Feedback({ onClose, t }) {
               ))}
             </div>
             <button onClick={onClose} style={{ ...s.submitBtn, marginTop: 32, cursor: "pointer" }}>
-              Fermer
+              {t.fbClose}
             </button>
           </div>
         )}

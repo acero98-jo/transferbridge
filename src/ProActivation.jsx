@@ -1,74 +1,36 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
+import { fmt } from "./i18n/index.js";
 
-const PLANS = [
-  {
-    id: "monthly",
-    icon: "⚡",
-    name: "Pro Mensuel",
-    price: "19.99€",
-    period: "/mois",
-    color: "#3b82f6",
-    colorBg: "rgba(59,130,246,0.12)",
-    colorBorder: "rgba(59,130,246,0.3)",
-    badge: null,
-    features: [
-      "📱→💻 Téléphone vers PC illimité",
-      "💻→📱 PC vers Téléphone",
-      "♾️ Taille de fichier illimitée",
-      "📅 Envois illimités/jour",
-      "1️⃣ 1 appareil à la fois",
-      "🔒 Accès distant en HTTPS (Cloudflare)",
-      "☁️ Mode Relay cloud",
-      "📜 Historique illimité",
-      "🎯 Support prioritaire",
-    ],
+const PLAN_STYLES = {
+  monthly: {
+    icon: "⚡", price: "19.99€",
+    color: "#3b82f6", colorBg: "rgba(59,130,246,0.12)", colorBorder: "rgba(59,130,246,0.3)",
     checkout: "https://transferbridge.site/checkout.html?plan=monthly",
   },
-  {
-    id: "annual",
-    icon: "🚀",
-    name: "Pro Annuel",
-    price: "99.99€",
-    period: "/an",
-    color: "#8b5cf6",
-    colorBg: "rgba(139,92,246,0.12)",
-    colorBorder: "rgba(139,92,246,0.3)",
-    badge: "🔥 Économise 58%",
-    features: [
-      "Tout du plan Mensuel",
-      "3️⃣ 3 appareils simultanés",
-      "💻→💻 Transfert PC vers PC (bientôt)",
-      "🔔 Accès prioritaire aux mises à jour",
-      "🎁 Fonctionnalités bêta en avant-première",
-    ],
+  annual: {
+    icon: "🚀", price: "99.99€",
+    color: "#8b5cf6", colorBg: "rgba(139,92,246,0.12)", colorBorder: "rgba(139,92,246,0.3)",
     checkout: "https://transferbridge.site/checkout.html?plan=annual",
   },
-  {
-    id: "team",
+  team: {
     icon: "🏢",
-    name: "Team",
-    price: "Sur devis",
-    period: "",
-    color: "#22c55e",
-    colorBg: "rgba(34,197,94,0.12)",
-    colorBorder: "rgba(34,197,94,0.3)",
-    badge: "Famille & Entreprise",
-    features: [
-      "Tout du plan Annuel",
-      "👥 Appareils illimités",
-      "📊 Dashboard partagé (bientôt)",
-      "🔑 API access (bientôt)",
-      "🧾 Facturation unifiée",
-      "🔐 SSO Entreprise (bientôt)",
-      "📞 Support dédié",
-    ],
+    color: "#22c55e", colorBg: "rgba(34,197,94,0.12)", colorBorder: "rgba(34,197,94,0.3)",
     checkout: "https://transferbridge.site/checkout.html?plan=team",
   },
-];
+};
 
-export default function ProActivation({ onActivated, onClose }) {
+function buildPlans(t) {
+  return [
+    { id: "monthly", ...PLAN_STYLES.monthly, name: t.planMonthly, period: t.perMonth, badge: null, features: t.planMonthlyFeatures },
+    { id: "annual", ...PLAN_STYLES.annual, name: t.planAnnual, period: t.perYear, badge: t.badgeAnnual, features: t.planAnnualFeatures },
+    { id: "team", ...PLAN_STYLES.team, name: t.planTeam, price: t.onQuote, period: "", badge: t.badgeTeam, features: t.planTeamFeatures },
+  ];
+}
+
+export default function ProActivation({ t, onActivated, onClose }) {
+  const PLANS = buildPlans(t);
   const [step, setStep] = useState("plans"); // plans | activate
   const [selectedPlan, setSelectedPlan] = useState(null);
   const [key, setKey] = useState("");
@@ -90,11 +52,11 @@ export default function ProActivation({ onActivated, onClose }) {
   async function activate() {
     const cleaned = key.trim().toUpperCase();
     if (!cleaned.startsWith("TB-") || cleaned.split("-").length !== 5) {
-      setError("Format invalide. La clé doit être : TB-XXXX-XXXX-XXXX-XXXX");
+      setError(t.proErrFormat);
       return;
     }
     if (!selectedPlan) {
-      setError("Sélectionne d'abord un plan.");
+      setError(t.proErrNoPlan);
       return;
     }
     setLoading(true);
@@ -110,14 +72,9 @@ export default function ProActivation({ onActivated, onClose }) {
         onClose();
       }, 2500);
     } catch (e) {
-      const msg = e?.toString() || "";
-      if (msg.includes("appareil")) {
-        setError("❌ Cette clé est déjà activée sur un autre appareil. Déconnecte-la d'abord depuis l'autre PC.");
-      } else if (msg.includes("invalide")) {
-        setError("❌ Clé invalide. Vérifie la clé reçue par email.");
-      } else {
-        setError("❌ Erreur de vérification. Vérifie ta connexion internet.");
-      }
+      // Le backend renvoie un code stable (ex. "device_limit", "not_found")
+      const code = String(e?.message ?? e).replace(/^Error:\s*/, "").trim();
+      setError(t.licErr[code] || t.licErr.generic);
     } finally {
       setLoading(false);
     }
@@ -131,12 +88,12 @@ export default function ProActivation({ onActivated, onClose }) {
         <div style={s.header}>
           <div>
             <h2 style={s.title}>
-              {step === "plans" ? "⚡ Passer à Pro" : `⚡ Activer ${selectedPlan?.name}`}
+              {step === "plans" ? t.proTitle : fmt(t.proActivateTitle, { plan: selectedPlan?.name })}
             </h2>
             <p style={s.sub}>
               {step === "plans"
-                ? "Choisissez le plan qui vous convient"
-                : "Entrez votre clé de licence reçue par email"
+                ? t.proChoose
+                : t.proEnterKey
               }
             </p>
           </div>
@@ -147,9 +104,9 @@ export default function ProActivation({ onActivated, onClose }) {
         {success && (
           <div style={s.successScreen}>
             <div style={{ fontSize: 64, marginBottom: 16 }}>🎉</div>
-            <h3 style={s.successTitle}>Plan {selectedPlan?.name} activé !</h3>
+            <h3 style={s.successTitle}>{fmt(t.proActivated, { plan: selectedPlan?.name })}</h3>
             <p style={s.successSub}>
-              Toutes les fonctionnalités sont maintenant débloquées sur cet appareil.
+              {t.proUnlocked}
             </p>
             <div style={{ fontSize: 40, marginTop: 16 }}>✨</div>
           </div>
@@ -161,12 +118,12 @@ export default function ProActivation({ onActivated, onClose }) {
 
             {/* Comparaison rapide gratuit vs pro */}
             <div style={s.freeCompare}>
-              <div style={s.freeCompareLabel}>Plan Gratuit actuel</div>
+              <div style={s.freeCompareLabel}>{t.proCurrentFree}</div>
               <div style={s.freeCompareFeatures}>
-                <span style={s.featureBad}>❌ 10 envois/jour max</span>
-                <span style={s.featureBad}>❌ 500MB max/fichier</span>
-                <span style={s.featureBad}>❌ Téléphone → PC uniquement</span>
-                <span style={s.featureBad}>❌ 7 jours d'historique</span>
+                <span style={s.featureBad}>{t.proFreeLimit1}</span>
+                <span style={s.featureBad}>{t.proFreeLimit2}</span>
+                <span style={s.featureBad}>{t.proFreeLimit3}</span>
+                <span style={s.featureBad}>{t.proFreeLimit4}</span>
               </div>
             </div>
 
@@ -208,14 +165,14 @@ export default function ProActivation({ onActivated, onClose }) {
                       onClick={e => { e.stopPropagation(); goToCheckout(plan); }}
                       style={{ ...s.planBtn, background: plan.color }}
                     >
-                      Nous contacter
+                      {t.proContact}
                     </button>
                   ) : (
                     <button
                       onClick={e => { e.stopPropagation(); goToCheckout(plan); }}
                       style={{ ...s.planBtn, background: plan.color }}
                     >
-                      Acheter {plan.price}
+                      {fmt(t.proBuy, { price: plan.price })}
                     </button>
                   )}
                 </div>
@@ -224,12 +181,12 @@ export default function ProActivation({ onActivated, onClose }) {
 
             {/* Déjà une clé ? */}
             <div style={s.alreadyHaveKey}>
-              <span style={{ color: "#64748b", fontSize: 12 }}>Vous avez déjà une clé de licence ?</span>
+              <span style={{ color: "#64748b", fontSize: 12 }}>{t.proHaveKey}</span>
               <button
                 onClick={() => { if (!selectedPlan) setSelectedPlan(PLANS[0]); setStep("activate"); }}
                 style={s.alreadyKeyBtn}
               >
-                Activer ma clé →
+                {t.proActivateKey}
               </button>
             </div>
           </div>
@@ -250,16 +207,16 @@ export default function ProActivation({ onActivated, onClose }) {
                 <div>
                   <div style={{ fontSize: 13, fontWeight: 700, color: "#f1f5f9" }}>{selectedPlan.name}</div>
                   <div style={{ fontSize: 11, color: "#64748b" }}>
-                    {selectedPlan.price}{selectedPlan.period} — Licence liée à cet appareil
+                    {selectedPlan.price}{selectedPlan.period} — {t.proBoundDevice}
                   </div>
                 </div>
-                <button onClick={() => setStep("plans")} style={s.changePlanBtn}>Changer</button>
+                <button onClick={() => setStep("plans")} style={s.changePlanBtn}>{t.proChange}</button>
               </div>
             )}
 
             {/* Champ clé */}
             <div style={{ marginBottom: 6, marginTop: 16 }}>
-              <label style={s.keyLabel}>🔑 Clé de licence (reçue par email)</label>
+              <label style={s.keyLabel}>{t.proKeyLabel}</label>
             </div>
             <input
               type="text"
@@ -282,19 +239,19 @@ export default function ProActivation({ onActivated, onClose }) {
                 cursor: loading || !key.trim() ? "not-allowed" : "pointer",
               }}
             >
-              {loading ? "⏳ Vérification en cours..." : "⚡ Activer la licence"}
+              {loading ? t.proVerifying : t.proActivateBtn}
             </button>
 
             <div style={s.activateInfo}>
-              🔒 La licence sera liée à cet appareil uniquement.<br/>
-              Pour changer d'appareil, utilisez "Déconnecter" dans les paramètres.
+              {t.proBoundInfo1}<br/>
+              {t.proBoundInfo2}
             </div>
 
             {/* Pas encore de clé */}
             <div style={s.alreadyHaveKey}>
-              <span style={{ color: "#64748b", fontSize: 12 }}>Pas encore de clé ?</span>
+              <span style={{ color: "#64748b", fontSize: 12 }}>{t.proNoKey}</span>
               <button onClick={() => setStep("plans")} style={s.alreadyKeyBtn}>
-                ← Voir les plans
+                {t.proSeePlans}
               </button>
             </div>
           </div>

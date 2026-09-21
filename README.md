@@ -27,7 +27,8 @@ Pousser un tag `vX.Y.Z` déclenche [.github/workflows/release.yml](.github/workf
 
 L'app appelle un Worker Cloudflare (`WORKER_URL` dans [src-tauri/src/lib.rs](src-tauri/src/lib.rs)) pour :
 
-- la vérification des licences (`POST /`) ;
+- l'activation des licences (`POST /`) : le Worker répond avec un jeton signé Ed25519 (clé, plan, appareil, expiration) que l'app vérifie avec la clé publique intégrée (`LICENSE_PUBLIC_KEY_B64`) ;
+- la revalidation quotidienne (`POST /license/check`, détecte les révocations) et la libération d'un appareil (`POST /license/deactivate`) ;
 - l'envoi des feedbacks (`POST /feedback`), qui relaie vers Discord. Le webhook Discord est un secret du Worker et ne doit jamais figurer dans ce dépôt. Voir [worker/feedback-relay.js](worker/feedback-relay.js).
 
 ## Sécurité
