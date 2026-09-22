@@ -953,8 +953,12 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
 
 // ─── Routes HTTP ──────────────────────────────────────────────────
 
+fn mobile_ui_html() -> String {
+    MOBILE_UI.replace("__APP_VERSION__", env!("CARGO_PKG_VERSION"))
+}
+
 async fn serve_mobile_ui() -> Html<String> {
-    Html(MOBILE_UI.to_string())
+    Html(mobile_ui_html())
 }
 
 // Route HTTP pour infos plan (accessible depuis le téléphone)
@@ -2062,5 +2066,17 @@ mod key_config_tests {
     #[test]
     fn embedded_license_public_key_is_a_valid_ed25519_key() {
         license_verifying_key().expect("LICENSE_PUBLIC_KEY_B64 doit être une clé Ed25519 valide");
+    }
+}
+
+#[cfg(test)]
+mod mobile_page_tests {
+    use super::*;
+
+    #[test]
+    fn mobile_page_shows_the_real_app_version() {
+        let html = mobile_ui_html();
+        assert!(!html.contains("__APP_VERSION__"), "le marqueur de version doit être remplacé");
+        assert!(html.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     }
 }
