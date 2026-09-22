@@ -480,6 +480,31 @@ async fn start_server(
         });
     }
 
+    // ── Revalidation périodique de la licence ──
+    // Sans ceci, une licence révoquée ou expirée ne serait jamais réévaluée
+    // tant que l'app reste ouverte (check_license n'est appelé qu'au démarrage
+    // côté React) : le tunnel Relay cloud resterait joignable indéfiniment.
+    {
+        let app_clone      = app.clone();
+        let plan_arc       = Arc::clone(&global.plan);
+        let device_id_arc  = Arc::clone(&global.device_id);
+        let tunnel_proc    = Arc::clone(&global.tunnel_process);
+        let tunnel_act     = Arc::clone(&global.tunnel_active);
+        let tunnel_url_arc = Arc::clone(&global.tunnel_url);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            interval.tick().await; // premier tick immédiat : rien à revalider si on vient de démarrer
+            loop {
+                interval.tick().await;
+                revalidate_license(
+                    &app_clone, &plan_arc, &device_id_arc,
+                    &tunnel_proc, &tunnel_act, &tunnel_url_arc,
+                ).await;
+            }
+        });
+    }
+
     Ok(format!("http://{}:{}", ip, port))
 }
 
@@ -791,82 +816,130 @@ async fn activate_license(
     Ok(())
 }
 
-#[tauri::command]
-async fn check_license(
-    app:    AppHandle,
-    global: tauri::State<'_, GlobalState>,
-) -> Result<serde_json::Value, String> {
-    let mut license = match load_license_data(&app).await {
-        Err(_) => return Ok(serde_json::json!({ "plan": "free", "valid": true })),
+/// Cœur de `check_license`, réutilisé par la revalidation périodique en tâche
+/// de fond (voir `start_server`). Ne dépend que des `Arc` nécessaires (et non
+/// de tout `GlobalState`) pour rester utilisable depuis une tâche `'static`.
+async fn revalidate_license(
+    app:            &AppHandle,
+    plan_arc:       &Arc<Mutex<PlanType>>,
+    device_id_arc:  &Arc<Mutex<String>>,
+    tunnel_process: &Arc<Mutex<Option<Child>>>,
+    tunnel_active:  &Arc<Mutex<bool>>,
+    tunnel_url:     &Arc<Mutex<Option<String>>>,
+) -> serde_json::Value {
+    // Ne coupe le tunnel et ne prévient l'interface que si on quitte
+    // réellement un plan payant (évite du bruit pour les utilisateurs gratuits).
+    async fn downgrade_to_free(
+        app: &AppHandle,
+        plan_arc: &Arc<Mutex<PlanType>>,
+        tunnel_process: &Arc<Mutex<Option<Child>>>,
+        tunnel_active: &Arc<Mutex<bool>>,
+        tunnel_url: &Arc<Mutex<Option<String>>>,
+    ) {
+        let was_paid = {
+            let mut p = plan_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let was = p.allows_bidirectional();
+            *p = PlanType::Free;
+            was
+        };
+        if was_paid {
+            stop_tunnel_raw(app, tunnel_process, tunnel_active, tunnel_url).await;
+            let _ = app.emit("plan-changed", "free");
+        }
+    }
+
+    let mut license = match load_license_data(app).await {
+        Err(_) => {
+            // Pas de fichier de licence : couvre aussi le cas où il aurait été
+            // supprimé manuellement pendant que l'app tournait encore.
+            downgrade_to_free(app, plan_arc, tunnel_process, tunnel_active, tunnel_url).await;
+            return serde_json::json!({ "plan": "free", "valid": true });
+        }
         Ok(license) => license,
     };
-    let device_id = global.device_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let set_plan = |p: PlanType| *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = p;
+    let device_id = device_id_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     // Licence créée avant les jetons signés : on en récupère un une seule fois.
     if license.token.is_none() {
         match request_activation(&license.key, license.plan.id(), &device_id).await {
             Ok(fresh) => {
-                write_license(&app, &fresh).await?;
+                let _ = write_license(app, &fresh).await;
                 license = fresh;
             }
             Err(code) => {
-                set_plan(PlanType::Free);
+                downgrade_to_free(app, plan_arc, tunnel_process, tunnel_active, tunnel_url).await;
                 let offline = code == "server_unreachable";
                 if !offline && code != "server_invalid" && code != "generic" {
-                    remove_license(&app).await;
+                    remove_license(app).await;
                 }
-                return Ok(serde_json::json!({
+                return serde_json::json!({
                     "plan": "free", "valid": false, "needs_online": offline, "code": code,
-                }));
+                });
             }
         }
     }
 
     match evaluate_license(&license, &device_id, unix_now()) {
         Err(LicenseIssue::Expired) => {
-            set_plan(PlanType::Free);
-            remove_license(&app).await;
-            Ok(serde_json::json!({ "plan": "free", "valid": false, "expired": true }))
+            downgrade_to_free(app, plan_arc, tunnel_process, tunnel_active, tunnel_url).await;
+            remove_license(app).await;
+            serde_json::json!({ "plan": "free", "valid": false, "expired": true })
         }
         Err(LicenseIssue::WrongDevice) => {
-            set_plan(PlanType::Free);
-            Ok(serde_json::json!({ "plan": "free", "valid": false, "wrong_device": true }))
+            downgrade_to_free(app, plan_arc, tunnel_process, tunnel_active, tunnel_url).await;
+            serde_json::json!({ "plan": "free", "valid": false, "wrong_device": true })
         }
         Err(_) => {
-            set_plan(PlanType::Free);
-            Ok(serde_json::json!({ "plan": "free", "valid": false, "invalid": true }))
+            downgrade_to_free(app, plan_arc, tunnel_process, tunnel_active, tunnel_url).await;
+            serde_json::json!({ "plan": "free", "valid": false, "invalid": true })
         }
         Ok(plan) => {
-            // Revalidation quotidienne : détecte une licence révoquée ou expirée côté serveur
+            // Revalidation quotidienne : détecte une licence révoquée côté serveur.
+            // Grâce à la tâche de fond de start_server, ceci s'exécute même si
+            // l'app reste ouverte plusieurs jours sans redémarrer.
             let now = unix_now();
             if now.saturating_sub(license.last_checked) > LICENSE_RECHECK_SECS {
                 match remote_check(&license.key, &device_id).await {
                     RemoteCheck::Valid => {
                         license.last_checked = now;
-                        let _ = write_license(&app, &license).await;
+                        let _ = write_license(app, &license).await;
                     }
                     RemoteCheck::Rejected(code) => {
-                        set_plan(PlanType::Free);
-                        remove_license(&app).await;
-                        return Ok(serde_json::json!({
+                        downgrade_to_free(app, plan_arc, tunnel_process, tunnel_active, tunnel_url).await;
+                        remove_license(app).await;
+                        return serde_json::json!({
                             "plan": "free", "valid": false, "revoked": true, "code": code,
-                        }));
+                        });
                     }
                     RemoteCheck::Unreachable => {}
                 }
             }
 
-            set_plan(plan.clone());
-            Ok(serde_json::json!({
+            *plan_arc.lock().unwrap_or_else(|e| e.into_inner()) = plan.clone();
+            serde_json::json!({
                 "plan":       plan,
                 "plan_label": plan.label(),
                 "valid":      true,
                 "expires_at": license.expires_at,
                 "key":        license.key,
-            }))
+            })
         }
     }
+}
+
+#[tauri::command]
+async fn check_license(
+    app:    AppHandle,
+    global: tauri::State<'_, GlobalState>,
+) -> Result<serde_json::Value, String> {
+    Ok(revalidate_license(
+        &app,
+        &global.plan,
+        &global.device_id,
+        &global.tunnel_process,
+        &global.tunnel_active,
+        &global.tunnel_url,
+    ).await)
 }
 
 #[tauri::command]
@@ -888,6 +961,7 @@ async fn deactivate_license(
 
     remove_license(&app).await;
     *global.plan.lock().unwrap_or_else(|e| e.into_inner()) = PlanType::Free;
+    stop_tunnel_raw(&app, &global.tunnel_process, &global.tunnel_active, &global.tunnel_url).await;
     let _ = app.emit("plan-changed", "free");
     println!("🔓 Licence désactivée sur cet appareil");
     Ok(())
@@ -1752,25 +1826,37 @@ async fn get_tunnel_status(
     }))
 }
 
-#[tauri::command]
-async fn stop_tunnel(
-    app:    AppHandle,
-    global: tauri::State<'_, GlobalState>,
-) -> Result<(), String> {
+/// Cœur de l'arrêt du tunnel, partagé entre la commande manuelle `stop_tunnel`
+/// et la revalidation de licence (qui doit couper le tunnel dès qu'un plan
+/// payant redevient gratuit — révocation, expiration, déconnexion).
+async fn stop_tunnel_raw(
+    app:            &AppHandle,
+    tunnel_process: &Arc<Mutex<Option<Child>>>,
+    tunnel_active:  &Arc<Mutex<bool>>,
+    tunnel_url:     &Arc<Mutex<Option<String>>>,
+) {
     // Extrait le Child du Mutex AVANT le .await (MutexGuard n'est pas Send)
     let child_opt = {
-        let mut process = global.tunnel_process.lock().unwrap_or_else(|e| e.into_inner());
+        let mut process = tunnel_process.lock().unwrap_or_else(|e| e.into_inner());
         process.take()
     };
 
     if let Some(mut child) = child_opt {
         let _ = child.kill().await;
-        println!("☁️  Tunnel Cloudflare arrêté manuellement");
     }
 
-    *global.tunnel_active.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *global.tunnel_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *tunnel_active.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    *tunnel_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let _ = app.emit("tunnel-stopped", serde_json::json!({ "active": false }));
+}
+
+#[tauri::command]
+async fn stop_tunnel(
+    app:    AppHandle,
+    global: tauri::State<'_, GlobalState>,
+) -> Result<(), String> {
+    stop_tunnel_raw(&app, &global.tunnel_process, &global.tunnel_active, &global.tunnel_url).await;
+    println!("☁️  Tunnel Cloudflare arrêté manuellement");
     Ok(())
 }
 
@@ -1779,18 +1865,7 @@ async fn restart_tunnel(
     app:    AppHandle,
     global: tauri::State<'_, GlobalState>,
 ) -> Result<(), String> {
-    // Extrait le Child du Mutex AVANT le .await (MutexGuard n'est pas Send)
-    let child_opt = {
-        let mut process = global.tunnel_process.lock().unwrap_or_else(|e| e.into_inner());
-        process.take()
-    };
-
-    if let Some(mut child) = child_opt {
-        let _ = child.kill().await;
-    }
-
-    *global.tunnel_active.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *global.tunnel_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    stop_tunnel_raw(&app, &global.tunnel_process, &global.tunnel_active, &global.tunnel_url).await;
 
     // Relance — clone tout ce dont on a besoin avant le .await
     let plan = global.plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
